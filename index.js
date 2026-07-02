@@ -32,6 +32,15 @@
     const BATCH_SIZE = 20;
     let lastSelectedChat = null; // Track last clicked for shift-select
     let lastSyncedCharacterId = null; // Track which character the proxy tree currently reflects
+
+    // ========== SEARCH CONTEXT PREVIEW ==========
+    // Cache of fetched chat content, keyed by fileName -> array of message strings.
+    // Chat files don't change while browsing history, so this is safe to keep
+    // for the lifetime of the page (cleared only if it grows too large).
+    let chatContentCache = {};
+    // In-flight fetches, keyed by fileName -> Promise, to dedupe concurrent requests
+    // for the same file (e.g. re-render happening mid-fetch).
+    let chatContentPromises = {};
     // Helper to clear selection
     function clearSelection() {
         selectedChats.clear();
@@ -130,6 +139,131 @@
         const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const regex = new RegExp(`(${escapedTerm})`, 'gi');
         return text.replace(regex, '<span style="background-color: rgba(255, 255, 0, 0.3); color: #fff; font-weight: bold;">$1</span>');
+    }
+
+    // ========== SEARCH CONTEXT PREVIEW ==========
+
+    // Fetches the full message content for a chat file from ST's backend.
+    // Returns an array of message strings (cached after first fetch).
+    // Fails soft: on any error, resolves to [] rather than throwing, so a
+    // fetch problem never breaks the (already-working) list rendering -
+    // it just means that one entry keeps showing its normal last-message preview.
+    async function fetchChatMessages(fileName) {
+        if (chatContentCache[fileName]) return chatContentCache[fileName];
+        if (chatContentPromises[fileName]) return chatContentPromises[fileName];
+
+        const promise = (async () => {
+            try {
+                const context = SillyTavern.getContext();
+                const headers = (typeof context.getRequestHeaders === 'function')
+                    ? context.getRequestHeaders()
+                    : { 'Content-Type': 'application/json' };
+
+                const isGroup = !!context.groupId;
+                // NOTE: the group-chat request shape below is best-effort and
+                // untested - group chat storage in ST works differently from
+                // solo chats. If it 404s/fails, this just falls back to the
+                // normal last-message preview for group chats (see catch below).
+                const url = isGroup ? '/api/chats/group/get' : '/api/chats/get';
+                const body = isGroup
+                    ? { id: context.groupId }
+                    : { avatar_url: getCurrentCharacterId(), file_name: fileName };
+
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(body)
+                });
+
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+
+                // The response is an array; the first line is a chat-header
+                // object (no 'mes' field) and the rest are message objects.
+                const messages = Array.isArray(data)
+                    ? data.filter(m => m && typeof m.mes === 'string').map(m => m.mes)
+                    : [];
+
+                chatContentCache[fileName] = messages;
+                return messages;
+            } catch (err) {
+                console.warn('[TMC] Could not fetch chat content for search preview:', fileName, err);
+                chatContentCache[fileName] = [];
+                return [];
+            } finally {
+                delete chatContentPromises[fileName];
+            }
+        })();
+
+        chatContentPromises[fileName] = promise;
+        return promise;
+    }
+
+    // Finds the first occurrence of `term` across all messages and returns a
+    // short snippet of surrounding context (not just the matched word).
+    function buildContextSnippet(messages, term, contextChars = 55) {
+        if (!term || !messages || !messages.length) return null;
+        const lowerTerm = term.toLowerCase();
+
+        for (const mes of messages) {
+            if (!mes) continue;
+            const idx = mes.toLowerCase().indexOf(lowerTerm);
+            if (idx === -1) continue;
+
+            const start = Math.max(0, idx - contextChars);
+            const end = Math.min(mes.length, idx + term.length + contextChars);
+            let snippet = mes.slice(start, end).replace(/\s+/g, ' ').trim();
+            if (start > 0) snippet = '…' + snippet;
+            if (end < mes.length) snippet = snippet + '…';
+            return snippet;
+        }
+        return null;
+    }
+
+    // Heuristic for locating the preview text node inside a native chat
+    // block. ST doesn't expose a stable class name we can rely on across
+    // versions, so instead we pick the leaf element (no element children)
+    // with the most text, excluding the title and any action/button areas -
+    // in practice this is reliably the last-message preview.
+    function findPreviewElement(el, titleEl) {
+        const candidates = el.querySelectorAll('div, span, p, small');
+        let best = null;
+        let bestLen = 0;
+
+        candidates.forEach(node => {
+            if (node === titleEl || (titleEl && titleEl.contains(node))) return;
+            if (node.children.length > 0) return; // want a leaf text container
+            if (node.closest('button, .tmc_mobile_menu, [class*="action"], [class*="button"]')) return;
+
+            const text = node.textContent.trim();
+            if (text.length > bestLen) {
+                bestLen = text.length;
+                best = node;
+            }
+        });
+
+        return best;
+    }
+
+    // Kicks off (async) replacement of a block's last-message preview with a
+    // highlighted snippet of context around the actual search match.
+    // Leaves the original preview untouched until/unless a match is found,
+    // and guards against the search term having changed by the time the
+    // fetch resolves (so fast typing can't leave stale snippets behind).
+    function enrichPreviewWithContext(el, fileName, searchTerm, titleEl) {
+        const previewEl = findPreviewElement(el, titleEl);
+        if (!previewEl) return;
+
+        fetchChatMessages(fileName).then(messages => {
+            if (!el.isConnected) return; // block was removed/re-rendered already
+
+            const snippet = buildContextSnippet(messages, searchTerm);
+            if (!snippet) return; // no match in content - leave last-message preview as-is
+
+            previewEl.innerHTML = highlightText(escapeHtml(snippet), searchTerm);
+            previewEl.title = snippet; // full snippet on hover, in case it's truncated visually
+            previewEl.classList.add('tmc_context_preview');
+        });
     }
 
 
@@ -492,6 +626,20 @@
             const searchBar = popup.querySelector('input[type="search"], input[type="text"], .search_input');
             const searchTerm = searchBar instanceof HTMLInputElement ? searchBar.value.trim().toLowerCase() : '';
 
+            // FIX: The proxy list previously never reacted to typing, because
+            // the MutationObserver only watches for specific target ids/classes
+            // and added nodes - it does not catch style/attribute changes on
+            // individual native chat blocks (which is how ST hides non-matches
+            // when you search). Binding directly to the input event is the
+            // reliable fix; the MutationObserver logic below stays as a
+            // secondary safety net for other DOM changes.
+            if (searchBar instanceof HTMLInputElement && !searchBar.dataset.tmcBound) {
+                searchBar.dataset.tmcBound = '1';
+                searchBar.addEventListener('input', () => {
+                    scheduleSync();
+                });
+            }
+
             // Apply Logic: Sort (Global or Folder-specific if we want, presently Global setting)
             const sortedData = sortChats(chatData);
 
@@ -585,10 +733,14 @@
             // Distribute chats into folders
             // Use sortedData instead of chatData
             sortedData.forEach(chat => {
-                // Check Native Filter: If native search is active, non-matches are hidden.
-                // We should respect this.
-                // FIX: This might be hiding everything if native logic hasn't run yet.
-                // if (chat.element.style.display === 'none') return;
+                // Check Native Filter: If native search is active, ST hides
+                // non-matching blocks via inline style. Respect that so the
+                // proxy list actually shrinks when you type a search term.
+                // (Previously disabled - re-enabled now that resync is
+                // reliably triggered on every keystroke via the input
+                // listener above, which avoids the "hides everything because
+                // native logic hasn't run yet" race that motivated disabling it.)
+                if (chat.element && chat.element.style && chat.element.style.display === 'none') return;
 
                 const isPinned = settings.pinned && settings.pinned[chat.fileName];
                 const fid = getFolderForChat(chat.fileName);
@@ -625,7 +777,11 @@
 
 
                 // Render first batch synchronously
-                renderBatch(fid, 0, BATCH_SIZE, container, searchTerm);
+                const initialBatchSize = searchTerm
+                    ? (chatsByFolder[fid] ? chatsByFolder[fid].length : 0)
+                    : BATCH_SIZE;
+
+                renderBatch(fid, 0, initialBatchSize, container, searchTerm);
             });
 
             proxyRoot.innerHTML = '';
@@ -884,6 +1040,11 @@
                     titleEl.prepend(pinIcon);
                 }
             }
+
+            // CONTEXTUAL PREVIEW: replace the (always-last-message) preview
+            // text with a snippet of context around where the search term
+            // actually appears in the chat, instead of the last message.
+            enrichPreviewWithContext(el, chatData.fileName, searchTerm, titleEl);
         }
 
         // BULK MODE VISUALS
