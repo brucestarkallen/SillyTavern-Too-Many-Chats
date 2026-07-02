@@ -1,9 +1,9 @@
 /**
  * Too Many Chats - SillyTavern Extension
- * Organizes chats per character into collapsible folders
- * v1.0.0 - Early Release
- * @author chaaruze
- * @version 1.0.0
+ * Chat organization and stuff
+ * v0.6.9 - Forever in dev
+ * @original author - chaaruze
+ * @picked up by - Kristalium
  */
 
 (function () {
@@ -31,6 +31,7 @@
     let sortOrder = 'date-desc'; // 'date-desc' | 'date-asc' | 'name-asc' | 'name-desc' (Prepared for Phase 2)
     const BATCH_SIZE = 20;
     let lastSelectedChat = null; // Track last clicked for shift-select
+    let lastSyncedCharacterId = null; // Track which character the proxy tree currently reflects
     // Helper to clear selection
     function clearSelection() {
         selectedChats.clear();
@@ -383,8 +384,11 @@
             return;
         }
 
-        // Observer for Infinite Scroll (Only in Folder View)
-        if (currentView === 'folder' && endIndex < chats.length) {
+        // Observer for Infinite Scroll.
+        // Runs in dedicated Folder View, AND for the Uncategorized ("Your chats") list
+        // in Main View, since that list is never truncated to 3 items and therefore
+        // needs its own way to keep loading more than the initial BATCH_SIZE.
+        if ((currentView === 'folder' || folderId === 'uncategorized') && endIndex < chats.length) {
             const sentinel = document.createElement('div');
             sentinel.className = 'tmc_sentinel';
             sentinel.style.height = '20px';
@@ -400,7 +404,7 @@
         }
     }
 
-    function initIntersectionObserver() {
+    function initIntersectionObserver(rootEl = null) {
         if (observer) observer.disconnect();
 
         observer = new IntersectionObserver((entries) => {
@@ -422,7 +426,10 @@
                     }
                 }
             });
-        }, { root: document.querySelector('#tmc_proxy_root'), rootMargin: '200px' });
+        // Root the observer on the actual scrolling container (the popup body),
+        // not on #tmc_proxy_root, which has no overflow/scroll of its own and
+        // therefore can't reliably act as an IntersectionObserver root.
+        }, { root: rootEl || null, rootMargin: '300px' });
     }
 
 
@@ -488,16 +495,17 @@
             // Apply Logic: Sort (Global or Folder-specific if we want, presently Global setting)
             const sortedData = sortChats(chatData);
 
+            const body = popup.querySelector('.shadow_select_chat_popup_body') || popup;
+
             let proxyRoot = popup.querySelector('#tmc_proxy_root');
             if (!proxyRoot) {
                 proxyRoot = document.createElement('div');
                 proxyRoot.id = 'tmc_proxy_root';
 
-                const body = popup.querySelector('.shadow_select_chat_popup_body') || popup;
-                const searchBar = popup.querySelector('input[type="search"], input[type="text"], .search_input');
+                const searchBarEl = popup.querySelector('input[type="search"], input[type="text"], .search_input');
 
-                if (searchBar && searchBar.parentNode) {
-                    const searchContainer = searchBar.closest('.shadow_select_chat_popup_header') || searchBar.parentNode;
+                if (searchBarEl && searchBarEl.parentNode) {
+                    const searchContainer = searchBarEl.closest('.shadow_select_chat_popup_header') || searchBarEl.parentNode;
                     if (searchContainer.nextSibling) {
                         searchContainer.parentNode.insertBefore(proxyRoot, searchContainer.nextSibling);
                     } else {
@@ -514,8 +522,23 @@
 
             if (!characterId) {
                 proxyRoot.innerHTML = '<div style="padding:12px;opacity:0.6">Select a character</div>';
+                lastSyncedCharacterId = null;
                 return;
             }
+
+            // If the active character changed since we last rendered the proxy tree,
+            // any leftover folder-view / bulk-selection state belongs to the old
+            // character and must be reset so it doesn't leak into the new one.
+            if (characterId !== lastSyncedCharacterId) {
+                currentView = 'main';
+                viewFolderId = null;
+                if (bulkMode || selectedChats.size > 0) {
+                    bulkMode = false;
+                    selectedChats.clear();
+                    updateBulkBar();
+                }
+            }
+            lastSyncedCharacterId = characterId;
 
             const folderContents = {};
             const folderIds = settings.characterFolders[characterId] || [];
@@ -549,7 +572,10 @@
             }
 
 
-            if (!observer) initIntersectionObserver();
+            // Always (re)root the observer on the real scrolling container. Sentinels
+            // are recreated every sync anyway, so this is cheap and keeps the root
+            // correct even if the popup element instance changes.
+            initIntersectionObserver(body);
 
             // Populate chatsByFolder memory store
             chatsByFolder = {};
@@ -1131,6 +1157,14 @@
                         const cleanName = fileName.replace(/\.jsonl$/i, '');
                         await deleteCharacterChatByName(characterId, cleanName);
                         deletedCount++;
+
+                        // deleteCharacterChatByName bypasses ST's own delete-button click
+                        // flow, so ST never gets a chance to remove this chat's entry from
+                        // the already-rendered native popup list. Remove it ourselves so
+                        // the proxy tree doesn't keep mirroring a deleted chat until the
+                        // popup is closed and reopened.
+                        const originalBlock = document.querySelector(`.select_chat_block[file_name="${fileName}"]:not(.tmc_proxy_block)`);
+                        if (originalBlock) originalBlock.remove();
                     } catch (err) {
                         console.warn('[TMC] deleteCharacterChatByName failed for:', fileName, err);
                     }
@@ -1369,6 +1403,9 @@
             const manageBtn = e.target.closest('#option_select_chat, [onclick*="select_chat"], .mes_button[title*="Chat"], [data-i18n="Manage"]');
             if (manageBtn) {
                 userOpenedPanel = true;
+                // Force a resync as soon as the panel is opened, rather than relying
+                // solely on the mutation observer / heartbeat to notice.
+                scheduleSync();
             }
         }, true);
 
@@ -1379,9 +1416,18 @@
                 const proxy = popup.querySelector('#tmc_proxy_root');
                 const nativeBlocks = popup.querySelectorAll('.select_chat_block:not(.tmc_proxy_block)');
                 const proxyBlocks = popup.querySelectorAll('.tmc_proxy_block');
+                const activeCharacterId = getCurrentCharacterId();
 
-                // Re-sync if: no proxy root, or native blocks exist but no proxy blocks
-                if (!proxy || proxy.children.length === 0 || (nativeBlocks.length > 0 && proxyBlocks.length === 0)) {
+                // Re-sync if: no proxy root, or native blocks exist but no proxy blocks,
+                // or (critically) the active character has changed since the proxy tree
+                // was last built. That last case covers switching characters while the
+                // popup is closed, or while it's open but reused/cached by SillyTavern
+                // without emitting a mutation our observer catches — without this check
+                // the proxy tree can keep showing the previous character's chats until
+                // some unrelated action (sort/bulk) happens to force a resync.
+                if (!proxy || proxy.children.length === 0 ||
+                    (nativeBlocks.length > 0 && proxyBlocks.length === 0) ||
+                    (activeCharacterId && activeCharacterId !== lastSyncedCharacterId)) {
                     scheduleSync();
                 }
             }
