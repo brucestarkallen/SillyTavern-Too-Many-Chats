@@ -6,7 +6,7 @@
 ![Version](https://img.shields.io/badge/version-0.6.9-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
-**Organize your SillyTavern chats into collapsible folders**
+**Organize your SillyTavern chats, search and delete**
 
 [Features](#-features) • [Installation](#-installation) • [Usage](#-usage)
 
@@ -17,6 +17,7 @@
 ## ✨ Features
 
 - **📂 Per-Character Folders** - Each character has independent folder sets
+- **🔍 Search Highlighting!** - Actually see what you are looking for!
 - **🗑️ Bulk Deletion** - Select many chats, delete many chats
 - **↕️ Sorting** - By number of messages, file size, date, name
 - **🔄 Collapsible** - Click folder headers to expand/collapse
