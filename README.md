@@ -3,7 +3,7 @@
 <div align="center">
 
 ![SillyTavern Extension](https://img.shields.io/badge/SillyTavern-Extension-orange?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-1.0.0-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.6.9-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
 **Organize your SillyTavern chats into collapsible folders**
@@ -17,6 +17,8 @@
 ## ✨ Features
 
 - **📂 Per-Character Folders** - Each character has independent folder sets
+- **🗑️ Bulk Deletion** - Select many chats, delete many chats
+- **↕️ Sorting** - By number of messages, file size, date, name
 - **🔄 Collapsible** - Click folder headers to expand/collapse
 - **🖱️ Right-Click Menu** - Move chats between folders instantly
 - **🎨 Native Theme** - Blends seamlessly with SillyTavern's UI
@@ -28,7 +30,7 @@
 ## 📦 Installation
 
 1. Open SillyTavern → **Extensions** → **Install Extension**
-2. Paste: `https://github.com/chaaruze/SillyTavern-Too-Many-Chats`
+2. Paste: `https://github.com/kristalium/SillyTavern-Too-Many-Chats`
 3. Click **Install** and refresh
 
 ---
@@ -47,6 +49,8 @@ Click any folder header to toggle visibility
 ### Manage Folders
 Hover over a folder → Click ✏️ to rename or 🗑️ to delete
 
+### Bulk delete
+Press select, select, delete
 ---
 
 ## 📄 License
@@ -57,6 +61,7 @@ Hover over a folder → Click ✏️ to rename or 🗑️ to delete
 
 <div align="center">
 
-Made with ❤️ by [chaaruze](https://github.com/chaaruze)
+Original author - [chaaruze](https://github.com/chaaruze)
 
+Picked up and continued by me, hello.
 </div>
