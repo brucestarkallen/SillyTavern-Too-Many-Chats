@@ -41,6 +41,13 @@
     // In-flight fetches, keyed by fileName -> Promise, to dedupe concurrent requests
     // for the same file (e.g. re-render happening mid-fetch).
     let chatContentPromises = {};
+    // Cache of parsed native chat-block data (dates, sizes, html, etc.), keyed
+    // by fileName -> { element, ... }. Avoids re-parsing every native block
+    // (regex date/size extraction, full innerHTML copy) on every sync, which
+    // otherwise runs once per keystroke while the search box is focused.
+    // Invalidated automatically per-entry when the underlying element changes
+    // (see the `cached.element === block` check in performSync).
+    let nativeDataCache = {};
     // Helper to clear selection
     function clearSelection() {
         selectedChats.clear();
@@ -585,6 +592,22 @@
             const chatData = nativeBlocks.map(block => {
                 const fileName = block.getAttribute('file_name') || block.title || block.innerText.split('\n')[0].trim();
 
+                // Perf: this map runs on every sync, including once per
+                // keystroke while searching. With a few hundred chats,
+                // re-parsing dates/sizes/counts via regex and re-copying
+                // full innerHTML for every native block on every keystroke
+                // is the main source of the "junky/laggy" typing feel.
+                // Native blocks are stable objects (ST only toggles their
+                // display style while filtering, it doesn't recreate them),
+                // so once we've parsed a given block we can reuse the result
+                // as long as it's still literally the same element. If ST
+                // ever does recreate the block (e.g. popup reopened), the
+                // identity check below naturally invalidates the cache entry.
+                const cached = nativeDataCache[fileName];
+                if (cached && cached.element === block) {
+                    return cached;
+                }
+
                 // Improved date extraction - try multiple sources
                 let dateStr = '';
 
@@ -612,7 +635,7 @@
                     }
                 }
 
-                return {
+                const data = {
                     element: block,
                     fileName,
                     title: extractChatTitle(fileName),
@@ -620,6 +643,8 @@
                     html: block.innerHTML, // Full native content with buttons
                     metadata: getChatMetadata(block, fileName)
                 };
+                nativeDataCache[fileName] = data;
+                return data;
             }).filter(d => d.fileName);
 
             // Capture Search Term
@@ -1538,6 +1563,25 @@
                             break;
                         }
                     }
+                }
+
+                // Detect native search finishing its own filtering pass.
+                // ST hides non-matching chat blocks by toggling their inline
+                // `style.display`, asynchronously and on its own timing (not
+                // necessarily in sync with our 200ms debounce off the input
+                // event). Previously we only resynced off the `input` event,
+                // so if ST's filter pass hadn't finished setting display:none
+                // yet by the time we read it, we'd render stale (unfiltered)
+                // results, and nothing would trigger a follow-up sync until
+                // another keystroke happened to land after ST finished -
+                // which is exactly the "type a trailing space to fix it" bug.
+                // Watching for the style mutation itself removes the race
+                // entirely, regardless of how long ST's filtering takes.
+                if (m.type === 'attributes' && m.attributeName === 'style' &&
+                    m.target.classList?.contains('select_chat_block') &&
+                    !m.target.classList.contains('tmc_proxy_block')) {
+                    needsSync = true;
+                    break;
                 }
             }
             if (needsSync && userOpenedPanel) scheduleSync();
