@@ -1,7 +1,7 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.11.0 - Deep-audit release: proxy delete/title fixes, click re-resolution, scroll/depth persistence, comparator precompute, id normalization, size-guarded enrich, jump-to-open
+ * v0.12.0 - Move chats between character cards (single + bulk, loss-safe); Cards browser mode (per-card sections, cross-card jump)
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -369,6 +369,366 @@
 
     function familyCollapseKey(root) {
         return String(getCurrentCharacterId() ?? '?') + '::' + root;
+    }
+
+    // ========== MOVE CHAT TO ANOTHER CHARACTER CARD (v0.12.0) ==========
+    // A real filesystem move via ST's own endpoints, ordered for safety:
+    //   read source -> write to target (verified; save also runs ST's own
+    //   backup) -> only then delete source (plain unlink, NO backup).
+    // A save failure aborts with the source intact; a delete failure leaves a
+    // duplicate — always the safe direction.
+
+    function stHeaders() {
+        const context = SillyTavern.getContext();
+        return (typeof context.getRequestHeaders === 'function')
+            ? context.getRequestHeaders()
+            : { 'Content-Type': 'application/json' };
+    }
+
+    function listOtherCharacters() {
+        const context = SillyTavern.getContext();
+        const current = getCurrentCharacterId();
+        return (context.characters || [])
+            .map((c, index) => ({ index, name: c?.name || '', avatar: c?.avatar || '' }))
+            .filter(c => c.avatar && c.avatar !== current);
+    }
+
+    async function getTargetChatNames(targetAvatar) {
+        const res = await fetch('/api/chats/search', {
+            method: 'POST', headers: stHeaders(),
+            body: JSON.stringify({ query: '', avatar_url: targetAvatar, group_id: null })
+        });
+        if (!res.ok) throw new Error('target listing failed: HTTP ' + res.status);
+        const results = await res.json();
+        return new Set((Array.isArray(results) ? results : []).map(r => normalizeChatId(r.file_name)));
+    }
+
+    // Never overwrite an existing chat on the target card.
+    function pickFreeName(base, takenSet) {
+        if (!takenSet.has(base)) return base;
+        for (let n = 2; n < 1000; n++) {
+            const candidate = `${base} #${n}`;
+            if (!takenSet.has(candidate)) return candidate;
+        }
+        return `${base} ${Date.now()}`;
+    }
+
+    // Returns a NEW chat array adapted for the target card: header
+    // character_name rewritten; AI messages whose speaker name equals the
+    // SOURCE card's name are renamed to the target's. User messages and
+    // differently-named NPCs are untouched.
+    function adaptChatForTarget(chatArray, sourceName, targetName) {
+        return chatArray.map((row, i) => {
+            if (!row || typeof row !== 'object') return row;
+            if (i === 0 && !('mes' in row)) {
+                return { ...row, character_name: targetName };
+            }
+            if (!row.is_user && sourceName && targetName && row.name === sourceName) {
+                return { ...row, name: targetName };
+            }
+            return row;
+        });
+    }
+
+    async function moveChatToCharacter(fileName, sourceAvatar, sourceName, target, takenSet) {
+        const id = normalizeChatId(fileName);
+        // 1. read source
+        const getRes = await fetch('/api/chats/get', {
+            method: 'POST', headers: stHeaders(),
+            body: JSON.stringify({ avatar_url: sourceAvatar, file_name: id })
+        });
+        if (!getRes.ok) return { ok: false, reason: 'read failed' };
+        const data = await getRes.json();
+        if (!Array.isArray(data) || data.length === 0) return { ok: false, reason: 'empty or unreadable' };
+
+        // 2. adapt + collision-free name
+        const adapted = adaptChatForTarget(data, sourceName, target.name);
+        const destName = pickFreeName(id, takenSet);
+        takenSet.add(destName);
+
+        // 3. write target (force: the integrity slug in chat_metadata refers
+        // to the SOURCE file state and must not block a fresh target write)
+        const saveRes = await fetch('/api/chats/save', {
+            method: 'POST', headers: stHeaders(),
+            body: JSON.stringify({ avatar_url: target.avatar, file_name: destName, chat: adapted, force: true })
+        });
+        let saveOk = saveRes.ok;
+        if (saveOk) {
+            try { saveOk = (await saveRes.json())?.ok === true; } catch { saveOk = false; }
+        }
+        if (!saveOk) return { ok: false, reason: 'write to target failed (source untouched)' };
+
+        // 4. delete source — failure here means a duplicate, not a loss
+        let warn = null;
+        const delRes = await fetch('/api/chats/delete', {
+            method: 'POST', headers: stHeaders(),
+            body: JSON.stringify({ avatar_url: sourceAvatar, chatfile: id + '.jsonl' })
+        });
+        if (!delRes.ok) warn = 'copied, but source copy could not be deleted';
+
+        // 5. bookkeeping on the source card
+        try {
+            const settings = getSettings();
+            const folderIds = settings.characterFolders[sourceAvatar] || [];
+            for (const fid of folderIds) {
+                const folder = settings.folders[fid];
+                if (folder && folder.chats) {
+                    folder.chats = folder.chats.filter(c => normalizeChatId(c) !== id);
+                }
+            }
+            if (settings.pinned) delete settings.pinned[String(sourceAvatar) + '::' + id];
+            if (settings.lastActive) {
+                delete settings.lastActive[String(sourceAvatar) + '::' + id];
+                // surface it on the target card immediately
+                settings.lastActive[String(target.avatar) + '::' + destName] = Date.now();
+                pruneLastActive(settings.lastActive);
+            }
+            saveSettings();
+        } catch (e) {
+            console.warn('[TMC] Post-move bookkeeping failed:', e);
+        }
+
+        const originalBlock = findNativeBlock(fileName);
+        if (originalBlock) originalBlock.remove();
+
+        return { ok: true, destName, warn };
+    }
+
+    async function bulkMoveToCharacter(fileNames, target) {
+        const context = SillyTavern.getContext();
+        if (context.groupId) {
+            toastr.info('Moving group chats between cards isn\'t supported');
+            return;
+        }
+        const sourceAvatar = getCurrentCharacterId();
+        if (!sourceAvatar) { toastr.error('No character selected'); return; }
+        const sourceName = (context.characters || []).find(c => c?.avatar === sourceAvatar)?.name || '';
+
+        let takenSet;
+        try {
+            takenSet = await getTargetChatNames(target.avatar);
+        } catch (e) {
+            console.warn('[TMC] Move aborted:', e);
+            toastr.error('Could not list target card\'s chats — move aborted');
+            return;
+        }
+
+        let moved = 0, skippedOpen = 0, failed = 0;
+        const warns = [];
+        for (const fileName of fileNames) {
+            // Never move the chat ST currently holds in memory: its next
+            // autosave would recreate the source file and desync everything.
+            if (isActiveChatFile(fileName)) { skippedOpen++; continue; }
+            try {
+                const r = await moveChatToCharacter(fileName, sourceAvatar, sourceName, target, takenSet);
+                if (r.ok) { moved++; if (r.warn) warns.push(`${fileName}: ${r.warn}`); }
+                else { failed++; console.warn('[TMC] Move failed:', fileName, r.reason); }
+            } catch (e) {
+                failed++; console.warn('[TMC] Move failed:', fileName, e);
+            }
+        }
+
+        let msg = `Moved ${moved} chat${moved !== 1 ? 's' : ''} to ${target.name}`;
+        if (skippedOpen) msg += `, skipped ${skippedOpen} open`;
+        if (failed) msg += `, ${failed} failed`;
+        (failed ? toastr.warning : toastr.success)(msg);
+        warns.forEach(w => toastr.info(w));
+        scheduleSync();
+    }
+
+    function showCharacterPicker(e, fileNames) {
+        document.querySelectorAll('.tmc_ctx').forEach(m => { if (m.cleanup) m.cleanup(); m.remove(); });
+
+        const cards = listOtherCharacters();
+        const menu = document.createElement('div');
+        menu.className = 'tmc_ctx tmc_charpicker';
+        menu.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);max-height:70vh;overflow-y:auto;min-width:240px;';
+
+        menu.innerHTML = `<div class="tmc_ctx_head">Move ${fileNames.length} chat${fileNames.length !== 1 ? 's' : ''} to card…</div>
+            <input type="text" class="tmc_charpicker_filter" placeholder="Filter cards…"
+                   style="width:calc(100% - 16px);margin:4px 8px;box-sizing:border-box;">`;
+
+        const list = document.createElement('div');
+        for (const card of cards) {
+            const item = document.createElement('div');
+            item.className = 'tmc_ctx_item';
+            item.textContent = '👤 ' + card.name;
+            item.dataset.filterName = card.name.toLowerCase();
+            item.onclick = async (ev) => {
+                ev.stopPropagation();
+                cleanup();
+                await bulkMoveToCharacter(fileNames, card);
+                clearSelection();
+            };
+            list.appendChild(item);
+        }
+        if (!cards.length) {
+            list.innerHTML = '<div class="tmc_ctx_item" style="opacity:.6">No other character cards</div>';
+        }
+        menu.appendChild(list);
+        document.body.appendChild(menu);
+
+        const filter = menu.querySelector('.tmc_charpicker_filter');
+        filter.oninput = () => {
+            const q = filter.value.trim().toLowerCase();
+            list.querySelectorAll('.tmc_ctx_item').forEach(it => {
+                it.style.display = (!q || (it.dataset.filterName || '').includes(q)) ? '' : 'none';
+            });
+        };
+        filter.onclick = (ev) => ev.stopPropagation();
+        setTimeout(() => filter.focus(), 60);
+
+        const closeHandler = (ev) => { if (!menu.contains(ev.target)) cleanup(); };
+        const escHandler = (ev) => { if (ev.key === 'Escape') cleanup(); };
+        function cleanup() {
+            menu.remove();
+            document.removeEventListener('click', closeHandler);
+            document.removeEventListener('keydown', escHandler);
+        }
+        setTimeout(() => {
+            document.addEventListener('click', closeHandler);
+            document.addEventListener('keydown', escHandler);
+        }, 50);
+        menu.cleanup = cleanup;
+    }
+
+    // ========== CARDS BROWSER (v0.12.0) ==========
+    // "Only see chats for a specific character card" without switching cards
+    // first: a browser mode listing every card as its own section with its
+    // recent chats underneath. One bounded /recent call; clicking a chat
+    // selects the card AND opens that chat; clicking a card header selects
+    // the card and drops back to its normal per-card list.
+    let cardsMode = false; // navigation surface — intentionally not persisted
+    let cardsData = { fetchedAt: 0, items: [] };
+    const CARDS_TTL_MS = 30000;
+    const CARDS_FETCH_MAX = 300;
+
+    async function refreshCardsData(force = false) {
+        const now = Date.now();
+        if (!force && (now - cardsData.fetchedAt) < CARDS_TTL_MS) return;
+        cardsData = { ...cardsData, fetchedAt: now };
+        try {
+            const res = await fetch('/api/chats/recent', {
+                method: 'POST', headers: stHeaders(),
+                body: JSON.stringify({ max: CARDS_FETCH_MAX, metadata: false })
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const items = await res.json();
+            cardsData = { fetchedAt: Date.now(), items: Array.isArray(items) ? items : [] };
+            scheduleSync();
+        } catch (e) {
+            console.warn('[TMC] Cards overview fetch failed:', e);
+            cardsData = { fetchedAt: Date.now(), items: [] };
+        }
+    }
+
+    // Pure: group /recent items into per-card sections, order = first
+    // appearance (mtime-desc input, so the most recently active card leads).
+    function buildCardsOverview(items, characters, groups) {
+        const byKey = {};
+        const order = [];
+        for (const item of (Array.isArray(items) ? items : [])) {
+            if (!item || typeof item.file_id !== 'string') continue;
+            let type = null, key = null;
+            if (item.avatar !== undefined) { type = 'char'; key = String(item.avatar); }
+            else if (item.group !== undefined) { type = 'group'; key = String(item.group); }
+            else continue; // root strays
+            const mapKey = type + '::' + key;
+            if (!byKey[mapKey]) {
+                let name;
+                if (type === 'char') {
+                    name = (characters || []).find(c => c?.avatar === key)?.name
+                        || key.replace(/\.png$/i, '');
+                } else {
+                    name = (groups || []).find(g => String(g?.id) === key)?.name
+                        || ('Group ' + key);
+                }
+                byKey[mapKey] = { type, key, name, chats: [] };
+                order.push(mapKey);
+            }
+            byKey[mapKey].chats.push({
+                id: item.file_id,
+                preview: item.mes || '',
+                count: item.chat_items || 0,
+            });
+        }
+        return order.map(k => byKey[k]);
+    }
+
+    async function jumpToCard(entry, chatId = null) {
+        cardsMode = false;
+        try {
+            if (entry.type === 'group') {
+                const g = await import('/scripts/group-chats.js');
+                await g.openGroupById(entry.key);
+                if (chatId) await g.openGroupChat(entry.key, chatId);
+            } else {
+                const s = await import('/script.js');
+                const context = SillyTavern.getContext();
+                const idx = (context.characters || []).findIndex(c => c?.avatar === entry.key);
+                if (idx < 0) { toastr.error('Card not found: ' + entry.name); return; }
+                await s.selectCharacterById(idx);
+                if (chatId) await s.openCharacterChat(chatId);
+            }
+        } catch (e) {
+            console.error('[TMC] Jump failed:', e);
+            toastr.error('Could not open ' + entry.name);
+        }
+        scheduleSync();
+    }
+
+    function renderCardsTree(proxyRoot) {
+        const context = SillyTavern.getContext();
+        const overview = buildCardsOverview(cardsData.items, context.characters, context.groups);
+        const frag = document.createDocumentFragment();
+
+        const note = document.createElement('div');
+        note.className = 'tmc_cards_note';
+        note.textContent = overview.length
+            ? 'All cards, most recently active first — tap a card to browse it, tap a chat to jump straight in.'
+            : (cardsData.fetchedAt ? 'No recent chats found.' : 'Loading cards…');
+        frag.appendChild(note);
+
+        for (const entry of overview) {
+            const section = document.createElement('div');
+            section.className = 'tmc_section tmc_card_section';
+
+            const header = document.createElement('div');
+            header.className = 'tmc_header';
+            header.style.cursor = 'pointer';
+            header.innerHTML = `
+                <div class="tmc_header_left">
+                    <span class="tmc_icon"><i class="fa-solid ${entry.type === 'group' ? 'fa-users' : 'fa-user'}"></i></span>
+                    <span class="tmc_name">${escapeHtml(entry.name)}</span>
+                    <span class="tmc_count">${entry.chats.length}</span>
+                </div>`;
+            header.title = 'Open this card\'s chat list';
+            header.onclick = () => jumpToCard(entry);
+            section.appendChild(header);
+
+            const content = document.createElement('div');
+            content.className = 'tmc_content';
+            for (const chat of entry.chats.slice(0, 8)) {
+                const row = document.createElement('div');
+                row.className = 'tmc_card_chat';
+                row.innerHTML = `<span class="tmc_card_chat_title">${escapeHtml(chat.id)}</span>
+                    <span class="tmc_card_chat_preview">${escapeHtml(String(chat.preview).slice(0, 90))}</span>`;
+                row.onclick = () => jumpToCard(entry, chat.id);
+                content.appendChild(row);
+            }
+            if (entry.chats.length > 8) {
+                const more = document.createElement('div');
+                more.className = 'tmc_show_more';
+                more.innerHTML = `<i class="fa-solid fa-ellipsis"></i> ${entry.chats.length - 8} more — open the card`;
+                more.onclick = () => jumpToCard(entry);
+                content.appendChild(more);
+            }
+            section.appendChild(content);
+            frag.appendChild(section);
+        }
+
+        proxyRoot.innerHTML = '';
+        proxyRoot.appendChild(frag);
     }
 
     function escapeHtml(text) {
@@ -1090,6 +1450,15 @@
                 }
             }
 
+            // CARDS BROWSER (v0.12.0): a cross-card surface; replaces the
+            // per-card tree entirely while active.
+            if (cardsMode) {
+                refreshCardsData();
+                renderCardsTree(proxyRoot);
+                injectAddButton(popup);
+                return;
+            }
+
             const newTree = document.createDocumentFragment();
             const characterId = getCurrentCharacterId();
             const settings = getSettings();
@@ -1766,6 +2135,20 @@
             updateBulkBar();
         };
 
+        // CARDS BROWSER TOGGLE (v0.12.0)
+        const cardsBtn = document.createElement('div');
+        cardsBtn.className = 'menu_button tmc_add_btn tmc_cards_btn';
+        cardsBtn.innerHTML = '<i class="fa-solid fa-address-book"></i> Cards';
+        cardsBtn.title = 'Browse every character card\'s chats and jump between them';
+        if (cardsMode) cardsBtn.classList.add('tmc_toggle_on');
+        cardsBtn.onclick = (e) => {
+            e.stopPropagation();
+            cardsMode = !cardsMode;
+            cardsBtn.classList.toggle('tmc_toggle_on', cardsMode);
+            if (cardsMode) refreshCardsData(true);
+            scheduleSync();
+        };
+
         // JUMP TO OPEN CHAT (v0.11.0): the auto-scroll fires once per popup
         // open; this re-finds the OPEN row on demand — long lists, after
         // scrolling away, or after toggling views.
@@ -1850,6 +2233,7 @@
         // Inject into the header row (found earlier)
         if (!headerRow.querySelector('.tmc_add_btn')) {
             headerRow.appendChild(sortContainer);
+            headerRow.appendChild(cardsBtn);
             headerRow.appendChild(jumpBtn);
             headerRow.appendChild(famBtn);
             headerRow.appendChild(bulkBtn);
@@ -1875,6 +2259,7 @@
             <div class="tmc_bulk_info">${count} Selected</div>
             <div class="tmc_bulk_actions">
                 <button id="tmc_bulk_move" ${count === 0 ? 'disabled' : ''}><i class="fa-solid fa-folder-open"></i> Move</button>
+                <button id="tmc_bulk_movechar" ${count === 0 ? 'disabled' : ''}><i class="fa-solid fa-user-arrow-right"></i> To card</button>
                 <button id="tmc_bulk_delete" class="tmc_bulk_delete_btn" ${count === 0 ? 'disabled' : ''}><i class="fa-solid fa-trash"></i> Delete</button>
                 <button id="tmc_bulk_cancel">Cancel</button>
             </div>
@@ -1885,6 +2270,11 @@
         bar.querySelector('#tmc_bulk_move').onclick = (e) => {
             if (count === 0) return;
             showContextMenu(e, null, true); // true = bulk mode
+        };
+
+        bar.querySelector('#tmc_bulk_movechar').onclick = (e) => {
+            if (count === 0) return;
+            showCharacterPicker(e, Array.from(selectedChats));
         };
 
         bar.querySelector('#tmc_bulk_delete').onclick = async (e) => {
@@ -2045,6 +2435,7 @@
             html += `<div class="tmc_ctx_item" data-action="pin">📌 ${pinText}</div>`;
             // Add Rename and Delete
             html += `<div class="tmc_ctx_item" data-action="rename">✏️ Rename</div>`;
+            html += `<div class="tmc_ctx_item" data-action="movechar">👤 Move to card…</div>`;
             html += `<div class="tmc_ctx_item" data-action="delete" style="color:var(--red);">🗑️ Delete</div>`;
             html += '<div class="tmc_ctx_sep"></div>';
             html += '<div class="tmc_ctx_head">Move to</div>';
@@ -2071,6 +2462,10 @@
             } else {
                 if (item.dataset.action === 'pin') {
                     togglePin(fileName);
+                } else if (item.dataset.action === 'movechar') {
+                    menu.remove();
+                    showCharacterPicker(ev, [fileName]);
+                    return;
                 } else if (item.dataset.action === 'rename') {
                     // Trigger rename on original element
                     const originalBlock = findNativeBlock(fileName);
@@ -2183,6 +2578,7 @@
             scheduleSync();
         } else if (!visible && userOpenedPanel) {
             userOpenedPanel = false;
+            cardsMode = false;
             renderedCounts = {};
             if (bulkMode || selectedChats.size > 0) clearSelection();
         }
@@ -2242,7 +2638,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.11.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.12.0 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.11.0 one-time migration: normalize + dedupe stored folder chat

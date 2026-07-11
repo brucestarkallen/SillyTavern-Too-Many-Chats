@@ -185,7 +185,7 @@ console.log('[12] v0.8.1 perf wiring: fetch gated behind visible popup, observer
 console.log('[13] syncPanelVisibility: open/close transitions and bulk-bar teardown');
 {
     const mk = new Function('getPopupNodes', 'getComputedStyle', 'scheduleSync', 'clearSelection', 'state',
-        'let userOpenedPanel = state.open; let activeScrolledThisOpen = true; let bulkMode = state.bulk; let selectedChats = state.sel;\n'
+        'let userOpenedPanel = state.open; let activeScrolledThisOpen = true; let bulkMode = state.bulk; let selectedChats = state.sel; let cardsMode = true; let renderedCounts = {};\n'
         + extract('syncPanelVisibility')
         + '\nreturn { run: syncPanelVisibility, state: () => ({ userOpenedPanel, activeScrolledThisOpen }) };');
     let synced = 0, cleared = 0;
@@ -438,6 +438,107 @@ console.log('[32] Title resolver + jump-to-open');
     const ib = stripComments(extract('injectAddButton'));
     assert(ib.includes('tmc_jump_btn') && ib.includes('scrollIntoView'), 'jump-to-open button wired');
     assert(!src.includes('createRecentDOM'), 'dead createRecentDOM removed');
+}
+
+
+console.log('[33] pickFreeName: never overwrite on the target card');
+{
+    const pick = new Function(extract('pickFreeName') + '\nreturn pickFreeName;')();
+    const taken = new Set(['Saga', 'Saga #2']);
+    assert(pick('Fresh', taken) === 'Fresh', 'free name passes through');
+    assert(pick('Saga', taken) === 'Saga #3', 'collision walks past existing suffixes');
+}
+
+console.log('[34] adaptChatForTarget: header + source-named AI messages only');
+{
+    const adapt = new Function(extract('adaptChatForTarget') + '\nreturn adaptChatForTarget;')();
+    const input = [
+        { user_name: 'LO', character_name: 'Seika', chat_metadata: { main_chat: 'X' } },
+        { name: 'Seika', is_user: false, mes: 'hello' },
+        { name: 'LO', is_user: true, mes: 'hi' },
+        { name: 'Rival NPC', is_user: false, mes: 'hmph' },
+    ];
+    const out = adapt(input, 'Seika', 'Seika V2');
+    assert(out[0].character_name === 'Seika V2' && out[0].chat_metadata.main_chat === 'X', 'header rewritten, metadata preserved');
+    assert(out[1].name === 'Seika V2', 'source-named AI message renamed');
+    assert(out[2].name === 'LO' && out[3].name === 'Rival NPC', 'user + other NPCs untouched');
+    assert(input[0].character_name === 'Seika' && input[1].name === 'Seika', 'input array not mutated');
+}
+
+console.log('[35] buildCardsOverview: per-card sections, name resolution, ordering');
+{
+    const build = new Function(extract('buildCardsOverview') + '\nreturn buildCardsOverview;')();
+    const items = [
+        { file_id: 'B chat', avatar: 'Beta.png', mes: 'p', chat_items: 3 },
+        { file_id: 'A chat 1', avatar: 'Alpha.png', mes: 'q', chat_items: 5 },
+        { file_id: 'G chat', group: 777, mes: 'g', chat_items: 2 },
+        { file_id: 'A chat 2', avatar: 'Alpha.png', mes: 'r', chat_items: 1 },
+        { file_id: 'stray' },
+        null,
+    ];
+    const chars = [{ avatar: 'Alpha.png', name: 'Alpha Prime' }]; // Beta unresolvable
+    const groups = [{ id: 777, name: 'The Party' }];
+    const out = build(items, chars, groups);
+    assert(out.map(e => e.name).join('|') === 'Beta|Alpha Prime|The Party', 'first-appearance order (mtime), names resolved, avatar fallback strips .png: ' + out.map(e => e.name).join('|'));
+    assert(out[1].chats.map(c => c.id).join('|') === 'A chat 1|A chat 2', 'per-card chat order preserved');
+    assert(out.every(e => e.chats.length > 0) && out.length === 3, 'root strays and malformed items skipped');
+}
+
+console.log('[36] moveChatToCharacter: loss-safe pipeline ordering');
+{
+    const calls = [];
+    const mkFetch = (opts) => async (url, init) => {
+        const kind = url.includes('/get') ? 'get' : url.includes('/save') ? 'save' : url.includes('/delete') ? 'delete' : url;
+        calls.push(kind);
+        if (kind === 'get') return { ok: true, json: async () => (opts.emptyGet ? [] : [{ user_name: 'u', character_name: 'Src' }, { name: 'Src', is_user: false, mes: 'm' }]) };
+        if (kind === 'save') return { ok: !opts.saveFail, json: async () => ({ ok: !opts.saveFail }) };
+        if (kind === 'delete') return { ok: !opts.deleteFail };
+        return { ok: false };
+    };
+    const deps = 'let settingsObj = { folders: {}, characterFolders: {}, pinned: {}, lastActive: {} };';
+    const build = (opts) => new Function('fetch', 'SillyTavern', 'toastr', 'console',
+        deps
+        + '\nconst getSettings = () => settingsObj; const saveSettings = () => {}; const scheduleSync = () => {};'
+        + '\nconst findNativeBlock = () => null; const pruneLastActive = () => {};'
+        + '\n' + extract('normalizeChatId') + '\n' + extract('stHeaders') + '\n' + extract('adaptChatForTarget') + '\n' + extract('pickFreeName')
+        + '\nasync ' + extract('moveChatToCharacter')
+        + '\nreturn { move: moveChatToCharacter, settings: () => settingsObj };')(
+        mkFetch(opts), { getContext: () => ({ getRequestHeaders: () => ({}) }) }, { }, console);
+
+    // happy path
+    let h = build({});
+    let r = await h.move('Tale.jsonl', 'Src.png', 'Src', { avatar: 'Dst.png', name: 'Dst' }, new Set());
+    assert(r.ok === true && calls.join('>') === 'get>save>delete', 'order: read -> write target -> delete source');
+    assert(h.settings().lastActive['Dst.png::Tale'] > 0, 'moved chat stamped on the TARGET card');
+    // save failure aborts BEFORE delete
+    calls.length = 0;
+    r = await build({ saveFail: true }).move('Tale', 'Src.png', 'Src', { avatar: 'Dst.png', name: 'Dst' }, new Set());
+    assert(r.ok === false && !calls.includes('delete'), 'write failure -> source untouched, no delete issued');
+    // delete failure degrades to duplicate warning, still ok
+    calls.length = 0;
+    r = await build({ deleteFail: true }).move('Tale', 'Src.png', 'Src', { avatar: 'Dst.png', name: 'Dst' }, new Set());
+    assert(r.ok === true && !!r.warn, 'delete failure -> duplicate + warning, never loss');
+    // empty/unreadable source skipped before any write
+    calls.length = 0;
+    r = await build({ emptyGet: true }).move('Tale', 'Src.png', 'Src', { avatar: 'Dst.png', name: 'Dst' }, new Set());
+    assert(r.ok === false && !calls.includes('save'), 'unreadable source -> no write attempted');
+}
+
+console.log('[37] v0.12.0 wiring');
+{
+    const bm = stripComments(extract('bulkMoveToCharacter'));
+    assert(bm.includes('isActiveChatFile(fileName)'), 'open chat skipped (autosave would recreate the source file)');
+    assert(bm.includes('context.groupId') && bm.includes('supported'), 'group chats guarded with a clear message');
+    assert(stripComments(extract('updateBulkBar')).includes('tmc_bulk_movechar'), 'bulk bar carries To card');
+    assert(stripComments(extract('showContextMenu')).includes("'movechar'") || stripComments(extract('showContextMenu')).includes('movechar'), 'single-chat menu carries Move to card');
+    const ps = stripComments(extract('performSync'));
+    assert(ps.includes('if (cardsMode)') && ps.includes('renderCardsTree(proxyRoot)'), 'cards mode replaces the tree');
+    assert(stripComments(extract('syncPanelVisibility')).includes('cardsMode = false'), 'cards mode resets on popup close');
+    const jc = stripComments(extract('jumpToCard'));
+    assert(jc.includes('selectCharacterById(idx)') && jc.includes('openCharacterChat(chatId)'), 'solo jump: select card then open chat');
+    assert(jc.includes('openGroupById') && jc.includes('openGroupChat'), 'group jump wired');
+    const cb = parseInt(src.match(/const CARDS_FETCH_MAX = (\d+);/)[1], 10);
+    assert(cb <= 500, 'cards fetch bounded (' + cb + ')');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

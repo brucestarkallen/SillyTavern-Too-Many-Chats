@@ -825,3 +825,44 @@
     0%   { box-shadow: inset 0 0 0 2px var(--SmartThemeQuoteColor, #e0a044); }
     100% { box-shadow: inset 0 0 0 0 transparent; }
 }
+
+/* ========== v0.12.0: CARDS BROWSER + CHARACTER PICKER ========== */
+.tmc_cards_note {
+    padding: 6px 10px;
+    font-size: 11px;
+    opacity: 0.65;
+}
+
+.tmc_card_section > .tmc_header {
+    border-left: 3px solid color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 30%, transparent);
+}
+
+.tmc_card_chat {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 6px 10px 6px 26px;
+    cursor: pointer;
+    border-radius: 6px;
+}
+.tmc_card_chat:hover {
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 10%, transparent);
+}
+.tmc_card_chat_title {
+    font-size: 13px;
+}
+.tmc_card_chat_preview {
+    font-size: 11px;
+    opacity: 0.55;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tmc_charpicker_filter {
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 25%, transparent);
+    border-radius: 6px;
+    padding: 5px 8px;
+    color: inherit;
+}
