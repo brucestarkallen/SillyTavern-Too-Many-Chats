@@ -753,3 +753,35 @@
     margin-bottom: 10px;
 
 }
+
+/* ========== v0.7.0: ACTIVE CHAT MARKER ========== */
+.tmc_proxy_block.tmc_active {
+    border-left: 3px solid var(--SmartThemeQuoteColor, #e0a044) !important;
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 12%, transparent) !important;
+}
+
+.tmc_active_chip {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 7px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.4;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-radius: 8px;
+    color: var(--SmartThemeBlurTintColor, #1a1a1a);
+    background: var(--SmartThemeQuoteColor, #e0a044);
+    vertical-align: middle;
+    pointer-events: none;
+}
+
+/* Dot on folder headers containing the open chat (visible while collapsed
+   or when the chat is beyond the 3-item main-view truncation) */
+.tmc_section.tmc_has_active > .tmc_header .tmc_name::after {
+    content: '●';
+    margin-left: 6px;
+    font-size: 9px;
+    color: var(--SmartThemeQuoteColor, #e0a044);
+    vertical-align: middle;
+}

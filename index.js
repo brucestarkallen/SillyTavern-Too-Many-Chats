@@ -1,7 +1,7 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.6.9 - Forever in dev
+ * v0.7.0 - Observer split, active-chat marker, title XSS fix
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -21,7 +21,15 @@
         version: '1.1.0'
     });
 
-    let observer = null;
+    // v0.7.0 ROOT FIX: these were previously a single shared `observer` variable.
+    // initIntersectionObserver() runs on EVERY performSync and started with
+    // `observer.disconnect()` — which disconnected the *MutationObserver* and
+    // overwrote it with the IntersectionObserver. Net effect: after the first
+    // render, no DOM mutation (new blocks, native deletions, popup visibility,
+    // ST's search filtering) ever triggered a resync again; the extension was
+    // limping along on the 500ms heartbeat alone. Two observers, two variables.
+    let mutationObserver = null; // watches ST's native DOM for changes
+    let lazyObserver = null;     // IntersectionObserver for infinite scroll sentinels
     let syncDebounceTimer = null;
     let bulkMode = false;
     let selectedChats = new Set();
@@ -110,6 +118,36 @@
         }
         return null;
     }
+
+    // v0.7.0: Which chat is currently OPEN. Native ST marks this with a
+    // highlight="true" attribute on the block element, but our proxy copies
+    // block.innerHTML — which never includes the element's own attributes —
+    // so the marker was silently lost. Rather than copying the attribute
+    // (which native only sets at render time, so it can go stale), we compute
+    // it live from context: context.chatId is the chat file name (no
+    // extension) for solo chats and the group's chat_id for groups.
+    function getActiveChatName() {
+        try {
+            const context = SillyTavern.getContext();
+            let name = context.chatId;
+            if ((name === undefined || name === null)
+                && context.characterId !== undefined
+                && context.characters?.[context.characterId]) {
+                name = context.characters[context.characterId].chat;
+            }
+            return (name === undefined || name === null) ? null : String(name);
+        } catch {
+            return null;
+        }
+    }
+
+    function isActiveChatFile(fileName) {
+        const active = getActiveChatName();
+        if (!active || !fileName) return false;
+        return fileName.replace(/\.jsonl$/i, '') === active.replace(/\.jsonl$/i, '');
+    }
+
+    let activeScrolledThisOpen = false; // scroll to the open chat once per popup open
 
     function escapeHtml(text) {
         if (!text) return '';
@@ -496,6 +534,24 @@
 
         container.appendChild(fragment);
 
+        // v0.7.0: scroll the open chat into view, once per popup open. If the
+        // block gets removed before the frame renders (main view truncates
+        // folders to 3 items right after this), release the flag so a later
+        // render that actually shows it (e.g. folder view) can still scroll.
+        if (!activeScrolledThisOpen) {
+            const activeEl = container.querySelector('.tmc_active');
+            if (activeEl) {
+                activeScrolledThisOpen = true;
+                requestAnimationFrame(() => {
+                    if (activeEl.isConnected) {
+                        activeEl.scrollIntoView({ block: 'center' });
+                    } else {
+                        activeScrolledThisOpen = false;
+                    }
+                });
+            }
+        }
+
         // Update counts
         const section = container.closest('.tmc_section');
         const badge = section.querySelector('.tmc_count');
@@ -541,14 +597,14 @@
             sentinel.setAttribute('data-next-index', endIndex.toString());
             container.appendChild(sentinel);
 
-            if (observer) observer.observe(sentinel);
+            if (lazyObserver) lazyObserver.observe(sentinel);
         }
     }
 
     function initIntersectionObserver(rootEl = null) {
-        if (observer) observer.disconnect();
+        if (lazyObserver) lazyObserver.disconnect();
 
-        observer = new IntersectionObserver((entries) => {
+        lazyObserver = new IntersectionObserver((entries) => {
             entries.forEach(entry => {
                 if (entry.isIntersecting) {
                     const sentinel = entry.target;
@@ -558,7 +614,7 @@
 
                     if (folderId && !isNaN(nextIndex)) {
                         // CRITICAL: Unobserve immediately to prevent double-firing
-                        observer.unobserve(sentinel);
+                        lazyObserver.unobserve(sentinel);
                         // Add small delay to smooth out rapid scrolling
                         setTimeout(() => {
                             renderBatch(folderId, nextIndex, BATCH_SIZE);
@@ -705,6 +761,7 @@
             if (characterId !== lastSyncedCharacterId) {
                 currentView = 'main';
                 viewFolderId = null;
+                activeScrolledThisOpen = false;
                 if (bulkMode || selectedChats.size > 0) {
                     bulkMode = false;
                     selectedChats.clear();
@@ -824,6 +881,12 @@
         section.className = 'tmc_section';
         section.dataset.id = fid;
         section.dataset.collapsed = folder.collapsed ? 'true' : 'false';
+
+        // v0.7.0: dot on folders holding the open chat, so it's findable even
+        // when collapsed or truncated to 3 items in main view.
+        if (Array.isArray(folder.chats) && folder.chats.some(f => isActiveChatFile(f))) {
+            section.classList.add('tmc_has_active');
+        }
 
         const header = document.createElement('div');
         header.className = 'tmc_header';
@@ -1051,7 +1114,12 @@
                 // Preserve the PIN icon if it's there (it's prepended)
                 // Actually prepending adds it to the DOM, modifying textContent usually wipes it.
                 // We should highlight safely.
-                const highlighted = highlightText(chatData.title, searchTerm);
+                // v0.7.0 XSS FIX: title must be escaped BEFORE being handed to
+                // highlightText, which injects it into innerHTML. The snippet
+                // path below already did this; the title path did not, so a
+                // chat file literally named <img src=x onerror=...>.jsonl
+                // would execute. Filenames with < > are legal on Linux.
+                const highlighted = highlightText(escapeHtml(chatData.title), searchTerm);
 
                 // If we replace innerHTML, we lose the pin. 
                 // Let's re-append highlight logic carefully.
@@ -1070,6 +1138,22 @@
             // text with a snippet of context around where the search term
             // actually appears in the chat, instead of the last message.
             enrichPreviewWithContext(el, chatData.fileName, searchTerm, titleEl);
+        }
+
+        // ACTIVE CHAT MARKER (v0.7.0)
+        // Runs AFTER search highlighting on purpose: the highlight path
+        // rewrites titleEl.innerHTML, which would wipe a chip added earlier.
+        if (isActiveChatFile(chatData.fileName)) {
+            el.classList.add('tmc_active');
+            const chip = document.createElement('span');
+            chip.className = 'tmc_active_chip';
+            chip.textContent = 'Open';
+            const titleEl = el.querySelector('.select_chat_block_title') || el.querySelector('.avatar_title_div');
+            if (titleEl) {
+                titleEl.appendChild(chip);
+            } else {
+                el.prepend(chip);
+            }
         }
 
         // BULK MODE VISUALS
@@ -1536,9 +1620,9 @@
     // ========== OBSERVER ==========
 
     function initObserver() {
-        if (observer) observer.disconnect();
+        if (mutationObserver) mutationObserver.disconnect();
 
-        observer = new MutationObserver((mutations) => {
+        mutationObserver = new MutationObserver((mutations) => {
             let needsSync = false;
             for (const m of mutations) {
                 // IGNORE our own proxy elements
@@ -1587,7 +1671,7 @@
             if (needsSync && userOpenedPanel) scheduleSync();
         });
 
-        observer.observe(document.body, {
+        mutationObserver.observe(document.body, {
             childList: true,
             subtree: true,
             attributes: true,
@@ -1598,16 +1682,21 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v1.0.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.7.0 Loading...`);
         const ctx = SillyTavern.getContext();
 
-        ctx.eventSource.on(ctx.event_types.CHAT_CHANGED, scheduleSync);
+        ctx.eventSource.on(ctx.event_types.CHAT_CHANGED, () => {
+            // The open chat just changed — allow the next render to scroll to it.
+            activeScrolledThisOpen = false;
+            scheduleSync();
+        });
 
         // Listen for user opening chat history popup
         document.addEventListener('click', (e) => {
             const manageBtn = e.target.closest('#option_select_chat, [onclick*="select_chat"], .mes_button[title*="Chat"], [data-i18n="Manage"]');
             if (manageBtn) {
                 userOpenedPanel = true;
+                activeScrolledThisOpen = false;
                 // Force a resync as soon as the panel is opened, rather than relying
                 // solely on the mutation observer / heartbeat to notice.
                 scheduleSync();
