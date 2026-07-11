@@ -785,3 +785,19 @@
     color: var(--SmartThemeQuoteColor, #e0a044);
     vertical-align: middle;
 }
+
+/* ========== v0.8.0: BRANCH CHIP ========== */
+.tmc_branch_chip {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    font-size: 10px;
+    line-height: 1.4;
+    border-radius: 8px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 35%, transparent);
+    opacity: 0.75;
+    vertical-align: middle;
+    pointer-events: none;
+    white-space: nowrap;
+}

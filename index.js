@@ -1,7 +1,7 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.7.0 - Observer split, active-chat marker, title XSS fix
+ * v0.8.0 - Activity sort (true mtime recency), branch chips, persisted sort
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -18,6 +18,7 @@
         characterFolders: {},
         pinned: {},
         showRecent: true,
+        sortOrder: 'activity-desc',
         version: '1.1.0'
     });
 
@@ -36,7 +37,14 @@
     let currentView = 'main'; // 'main' | 'folder'
     let viewFolderId = null;
     let chatsByFolder = {}; // Memory store for lazy loading
-    let sortOrder = 'date-desc'; // 'date-desc' | 'date-asc' | 'name-asc' | 'name-desc' (Prepared for Phase 2)
+    // v0.8.0: default is 'activity-desc' — true recency by file modification
+    // order, matching ST's welcome-screen Recent list. The old default
+    // ('date-desc') sorts by the send_date of the LAST MESSAGE in the file,
+    // which makes a fresh branch of an old chat sink to the bottom next to
+    // its parent (branching copies old messages verbatim). Two different
+    // clocks; this is the one users actually mean by "recent".
+    // Persisted in settings; loaded in init().
+    let sortOrder = 'activity-desc';
     const BATCH_SIZE = 20;
     let lastSelectedChat = null; // Track last clicked for shift-select
     let lastSyncedCharacterId = null; // Track which character the proxy tree currently reflects
@@ -148,6 +156,83 @@
     }
 
     let activeScrolledThisOpen = false; // scroll to the open chat once per popup open
+
+    // ========== ACTIVITY DATA (v0.8.0) ==========
+    // Source of truth for "which chat was touched most recently": the server's
+    // /api/chats/recent endpoint, which stats every chat file and returns them
+    // in mtime-descending order (same clock as the welcome screen's Recent
+    // list). The payload does NOT include the mtime value itself for non-empty
+    // files (its last_mes field is the last message's send_date — the wrong
+    // clock again), so we use the array ORDER as a rank, never a timestamp.
+    // With metadata:true each item also carries chat_metadata.main_chat,
+    // giving branch parentage for free — no filename pattern guessing, works
+    // for renamed branches too.
+    let activityData = { charKey: null, fetchedAt: 0, rank: {}, branchOf: {} };
+    const ACTIVITY_TTL_MS = 15000;
+
+    // Pure: turn the /recent response into {rank, branchOf} for one character.
+    // items: server array (already mtime-desc). charKey: avatar png filename
+    // for solo chats, group id for groups (same values getCurrentCharacterId
+    // returns). Items from other characters, root-level stray .jsonl files
+    // (no avatar/group field), and malformed entries are skipped; rank indices
+    // stay dense over the survivors.
+    function buildActivityData(items, charKey) {
+        const rank = {};
+        const branchOf = {};
+        let i = 0;
+        for (const item of (Array.isArray(items) ? items : [])) {
+            if (!item || typeof item.file_id !== 'string') continue;
+            const key = item.avatar !== undefined ? item.avatar
+                : (item.group !== undefined ? item.group : null);
+            if (key === null || String(key) !== String(charKey)) continue;
+            if (!(item.file_id in rank)) rank[item.file_id] = i++;
+            const parent = (item.chat_metadata && typeof item.chat_metadata.main_chat === 'string')
+                ? item.chat_metadata.main_chat : null;
+            if (parent) branchOf[item.file_id] = parent;
+        }
+        return { rank, branchOf };
+    }
+
+    async function refreshActivityData(force = false) {
+        const charKey = getCurrentCharacterId();
+        if (!charKey) return;
+        const now = Date.now();
+        if (!force && activityData.charKey === charKey && (now - activityData.fetchedAt) < ACTIVITY_TTL_MS) return;
+        // Stamp before the await so concurrent syncs don't stack requests.
+        activityData = { ...activityData, charKey, fetchedAt: now };
+        try {
+            const context = SillyTavern.getContext();
+            const headers = (typeof context.getRequestHeaders === 'function')
+                ? context.getRequestHeaders()
+                : { 'Content-Type': 'application/json' };
+            const res = await fetch('/api/chats/recent', {
+                method: 'POST',
+                headers,
+                // No `pinned` on purpose: ST floats pinned chats to the front
+                // of this endpoint's sort, which would corrupt the mtime rank.
+                body: JSON.stringify({ max: 100000, metadata: true })
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const items = await res.json();
+            const { rank, branchOf } = buildActivityData(items, charKey);
+            activityData = { charKey, fetchedAt: Date.now(), rank, branchOf };
+            scheduleSync(); // re-render now that ranks exist
+        } catch (err) {
+            console.warn('[TMC] Activity fetch failed — activity sort falls back to message-date order:', err);
+            activityData = { charKey, fetchedAt: Date.now(), rank: {}, branchOf: {} };
+        }
+    }
+
+    function getActivityRank(fileName) {
+        const id = (fileName || '').replace(/\.jsonl$/i, '');
+        const r = activityData.rank[id];
+        return (typeof r === 'number') ? r : Number.MAX_SAFE_INTEGER;
+    }
+
+    function getBranchParent(fileName) {
+        const id = (fileName || '').replace(/\.jsonl$/i, '');
+        return activityData.branchOf[id] || null;
+    }
 
     function escapeHtml(text) {
         if (!text) return '';
@@ -484,6 +569,22 @@
             const metaB = b.metadata;
 
             switch (sortOrder) {
+                // v0.8.0: rank 0 = most recently modified. Files the server
+                // didn't report (race with a just-created chat, fetch failure)
+                // get MAX_SAFE_INTEGER and sink together; tie-break those by
+                // message date so a total fetch failure degrades to the old
+                // date sort instead of random order.
+                case 'activity-desc': {
+                    const ra = getActivityRank(a.fileName), rb = getActivityRank(b.fileName);
+                    if (ra !== rb) return ra - rb;
+                    return metaB.date - metaA.date;
+                }
+                case 'activity-asc': {
+                    const ra = getActivityRank(a.fileName), rb = getActivityRank(b.fileName);
+                    if (ra !== rb) return rb - ra;
+                    return metaA.date - metaB.date;
+                }
+
                 case 'name-asc': return metaA.name.localeCompare(metaB.name);
                 case 'name-desc': return metaB.name.localeCompare(metaA.name);
 
@@ -633,6 +734,11 @@
     function performSync() {
         // Only sync if user has opened the panel
         if (!userOpenedPanel) return;
+
+        // v0.8.0: fire-and-forget, TTL-gated. First render after popup open
+        // may lack ranks (falls back to date order); the fetch completion
+        // schedules another sync that re-renders with correct activity order.
+        refreshActivityData();
 
         try {
             const popups = [
@@ -1140,6 +1246,24 @@
             enrichPreviewWithContext(el, chatData.fileName, searchTerm, titleEl);
         }
 
+        // BRANCH CHIP (v0.8.0): parentage comes from chat_metadata.main_chat
+        // via the activity fetch — real data, not filename pattern matching,
+        // so renamed branches are covered too. textContent/title assignment
+        // only; no HTML injection surface.
+        const branchParent = getBranchParent(chatData.fileName);
+        if (branchParent) {
+            const bchip = document.createElement('span');
+            bchip.className = 'tmc_branch_chip';
+            bchip.textContent = '\u21B3 branch';
+            bchip.title = 'Branch of: ' + branchParent;
+            const bTitleEl = el.querySelector('.select_chat_block_title') || el.querySelector('.avatar_title_div');
+            if (bTitleEl) {
+                bTitleEl.appendChild(bchip);
+            } else {
+                el.prepend(bchip);
+            }
+        }
+
         // ACTIVE CHAT MARKER (v0.7.0)
         // Runs AFTER search highlighting on purpose: the highlight path
         // rewrites titleEl.innerHTML, which would wipe a chip added earlier.
@@ -1338,8 +1462,10 @@
         // Overlay fully with opacity 0 to ensure click capture
         sortSelect.style.cssText = 'position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer;';
         sortSelect.innerHTML = `
-                <option value="date-desc">Date (New)</option>
-                <option value="date-asc">Date (Old)</option>
+                <option value="activity-desc">Active (Recent)</option>
+                <option value="activity-asc">Active (Oldest)</option>
+                <option value="date-desc">Last Msg (New)</option>
+                <option value="date-asc">Last Msg (Old)</option>
                 <option value="name-asc">Name (A-Z)</option>
                 <option value="name-desc">Name (Z-A)</option>
                 <option value="count-desc">Msgs (Most)</option>
@@ -1348,9 +1474,13 @@
                 <option value="size-asc">Size (Small)</option>
             `;
         sortSelect.value = sortOrder; // Set current
+        sortContainer.title = 'Sort. "Active" = most recently modified file (branches float to top, like the Recent screen). "Last Msg" = date of the last message inside the chat (a branch of an old chat sorts next to its parent).';
 
         sortSelect.onchange = (e) => {
             sortOrder = e.target.value;
+            // v0.8.0: persist across reloads
+            getSettings().sortOrder = sortOrder;
+            saveSettings();
             scheduleSync();
         };
 
@@ -1682,12 +1812,23 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.7.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.8.0 Loading...`);
         const ctx = SillyTavern.getContext();
+
+        // v0.8.0: restore persisted sort choice (falls back to activity-desc
+        // via defaultSettings backfill in getSettings).
+        try {
+            const persisted = getSettings().sortOrder;
+            if (typeof persisted === 'string' && persisted) sortOrder = persisted;
+        } catch (e) {
+            console.warn('[TMC] Could not restore sort order:', e);
+        }
 
         ctx.eventSource.on(ctx.event_types.CHAT_CHANGED, () => {
             // The open chat just changed — allow the next render to scroll to it.
             activeScrolledThisOpen = false;
+            // Opening/writing a chat bumps its mtime; the cached rank is stale.
+            refreshActivityData(true);
             scheduleSync();
         });
 

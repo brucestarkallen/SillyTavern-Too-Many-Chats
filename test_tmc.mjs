@@ -90,5 +90,76 @@ console.log('[7] Reset wiring for scroll-once flag');
     assert(extract('createFolderDOM').includes('tmc_has_active'), 'folder dot wired');
 }
 
+
+console.log('[8] buildActivityData: character filtering, rank density, branch map');
+{
+    const build = new Function(extract('buildActivityData') + '\nreturn buildActivityData;')();
+    const items = [
+        { file_id: 'Branch #1 - Old', avatar: 'A.png', chat_metadata: { main_chat: 'Old' } },
+        { file_id: 'Fresh', avatar: 'A.png' },
+        { file_id: 'OtherChar', avatar: 'B.png' },
+        { file_id: 'GroupChat1', group: 'g1' },
+        { file_id: 'Old', avatar: 'A.png', chat_metadata: {} },
+        { file_id: 'RootStray' },
+        null,
+        { file_id: 42, avatar: 'A.png' },
+        { file_id: 'Fresh', avatar: 'A.png' },
+    ];
+    const a = build(items, 'A.png');
+    assert(JSON.stringify(a.rank) === JSON.stringify({ 'Branch #1 - Old': 0, 'Fresh': 1, 'Old': 2 }),
+        'rank dense over survivors, other chars/groups/root/malformed/dupes excluded: ' + JSON.stringify(a.rank));
+    assert(JSON.stringify(a.branchOf) === JSON.stringify({ 'Branch #1 - Old': 'Old' }), 'branch parentage from chat_metadata.main_chat only');
+    const g = build(items, 'g1');
+    assert(JSON.stringify(g.rank) === JSON.stringify({ 'GroupChat1': 0 }), 'group filtering by group id');
+    const gn = build([{ file_id: 'GC', group: 1720000000 }], 1720000000);
+    assert(gn.rank['GC'] === 0, 'numeric group id matches via String coercion');
+    assert(JSON.stringify(build(undefined, 'A.png')) === JSON.stringify({ rank: {}, branchOf: {} }), 'non-array input safe');
+}
+
+console.log('[9] sortChats: activity rank ordering with date tie-break fallback');
+{
+    const mkSort = new Function('sortOrder', 'activityData',
+        extract('getActivityRank') + '\n' + extract('sortChats') + '\nreturn sortChats;');
+    const chats = [
+        { fileName: 'Unranked2.jsonl', metadata: { name: 'unranked2', date: 111, msgCount: 0, size: 0 } },
+        { fileName: 'Fresh.jsonl', metadata: { name: 'fresh', date: 500, msgCount: 0, size: 0 } },
+        { fileName: 'Unranked.jsonl', metadata: { name: 'unranked', date: 999, msgCount: 0, size: 0 } },
+        { fileName: 'Branch #1 - Old.jsonl', metadata: { name: 'branch #1 - old', date: 50, msgCount: 0, size: 0 } },
+    ];
+    const ranked = { charKey: 'A.png', fetchedAt: 0, rank: { 'Branch #1 - Old': 0, 'Fresh': 1 }, branchOf: {} };
+    let out = mkSort('activity-desc', ranked)([...chats]).map(c => c.fileName);
+    assert(JSON.stringify(out) === JSON.stringify(['Branch #1 - Old.jsonl', 'Fresh.jsonl', 'Unranked.jsonl', 'Unranked2.jsonl']),
+        'activity-desc: fresh branch of OLD chat sorts FIRST (rank 0), unranked sink with date tie-break: ' + JSON.stringify(out));
+    out = mkSort('activity-desc', { charKey: null, fetchedAt: 0, rank: {}, branchOf: {} })([...chats]).map(c => c.fileName);
+    assert(JSON.stringify(out) === JSON.stringify(['Unranked.jsonl', 'Fresh.jsonl', 'Unranked2.jsonl', 'Branch #1 - Old.jsonl']),
+        'fetch-failure degradation: no ranks -> pure message-date desc');
+    out = mkSort('name-asc', ranked)([...chats]).map(c => c.fileName);
+    assert(out[0] === 'Branch #1 - Old.jsonl' && out[1] === 'Fresh.jsonl', 'regression: name-asc unaffected by ranks');
+}
+
+console.log('[10] getBranchParent: extension stripping and miss behavior');
+{
+    const getBP = new Function('activityData', extract('getBranchParent') + '\nreturn getBranchParent;')(
+        { charKey: 'A.png', fetchedAt: 0, rank: {}, branchOf: { 'X': 'Parent Chat' } });
+    assert(getBP('X.jsonl') === 'Parent Chat', 'strips .jsonl before lookup');
+    assert(getBP('X') === 'Parent Chat', 'bare name works');
+    assert(getBP('Y.jsonl') === null, 'miss returns null');
+    assert(getBP(null) === null, 'null-safe');
+}
+
+console.log('[11] v0.8.0 wiring: static structure of the real file');
+{
+    const rad = extract('refreshActivityData');
+    const radCode = rad.split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+    assert(!radCode.includes('pinned'), 'refresh omits pinned param in code (would corrupt mtime rank)');
+    assert(rad.includes('metadata: true') && rad.includes('/api/chats/recent'), 'requests /recent with metadata:true');
+    assert(extract('performSync').includes('refreshActivityData()'), 'performSync kicks TTL-gated refresh');
+    assert(src.includes("refreshActivityData(true)"), 'CHAT_CHANGED forces refresh (mtime just changed)');
+    assert(src.includes('"activity-desc">Active (Recent)') || src.includes("value=\"activity-desc\">Active (Recent)"), 'dropdown has Active option');
+    assert(src.includes("sortOrder: 'activity-desc'"), 'defaultSettings carries persisted default');
+    assert(src.includes('getSettings().sortOrder = sortOrder'), 'onchange persists selection');
+    assert(extract('createProxyBlock').includes('getBranchParent'), 'branch chip wired into proxy block');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
