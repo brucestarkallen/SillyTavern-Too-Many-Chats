@@ -1,7 +1,7 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.8.0 - Activity sort (true mtime recency), branch chips, persisted sort
+ * v0.8.1 - Perf: popup-scoped observer, gated activity fetch, LRU cache; fixes: group previews/bulk-delete, scoped pins
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -31,6 +31,7 @@
     // limping along on the 500ms heartbeat alone. Two observers, two variables.
     let mutationObserver = null; // watches ST's native DOM for changes
     let lazyObserver = null;     // IntersectionObserver for infinite scroll sentinels
+    let observedPopupNodes = []; // popup nodes the mutationObserver is attached to (v0.8.1)
     let syncDebounceTimer = null;
     let bulkMode = false;
     let selectedChats = new Set();
@@ -50,13 +51,33 @@
     let lastSyncedCharacterId = null; // Track which character the proxy tree currently reflects
 
     // ========== SEARCH CONTEXT PREVIEW ==========
-    // Cache of fetched chat content, keyed by fileName -> array of message strings.
-    // Chat files don't change while browsing history, so this is safe to keep
-    // for the lifetime of the page (cleared only if it grows too large).
+    // Cache of fetched chat content. v0.8.1: two structural fixes here.
+    // (1) SCOPE: keys are now `${characterKey}::${fileName}` — fileName alone
+    //     is only unique per character, so two characters with a chat named
+    //     "New Chat" used to share (and cross-contaminate) a cache entry.
+    // (2) BOUND: the old comment promised the cache was "cleared if it grows
+    //     too large" but no clearing code existed. Whole multi-MB chats
+    //     accumulated for the lifetime of the page — real jank on Android.
+    //     Now a small LRU: least-recently-used entries are evicted.
+    const CONTENT_CACHE_MAX = 24;
     let chatContentCache = {};
-    // In-flight fetches, keyed by fileName -> Promise, to dedupe concurrent requests
-    // for the same file (e.g. re-render happening mid-fetch).
+    let contentCacheOrder = []; // LRU order, oldest first
+    // In-flight fetches (same keying), to dedupe concurrent requests.
     let chatContentPromises = {};
+
+    function contentCacheKey(fileName) {
+        return String(getCurrentCharacterId() ?? '?') + '::' + fileName;
+    }
+
+    function touchContentCache(key) {
+        const i = contentCacheOrder.indexOf(key);
+        if (i > -1) contentCacheOrder.splice(i, 1);
+        contentCacheOrder.push(key);
+        while (contentCacheOrder.length > CONTENT_CACHE_MAX) {
+            const evicted = contentCacheOrder.shift();
+            delete chatContentCache[evicted];
+        }
+    }
     // Cache of parsed native chat-block data (dates, sizes, html, etc.), keyed
     // by fileName -> { element, ... }. Avoids re-parsing every native block
     // (regex date/size extraction, full innerHTML copy) on every sync, which
@@ -199,7 +220,14 @@
         const now = Date.now();
         if (!force && activityData.charKey === charKey && (now - activityData.fetchedAt) < ACTIVITY_TTL_MS) return;
         // Stamp before the await so concurrent syncs don't stack requests.
-        activityData = { ...activityData, charKey, fetchedAt: now };
+        // v0.8.1: if the character changed, the old rank/branch maps belong to
+        // the previous character — drop them NOW rather than serving them for
+        // the duration of the fetch.
+        if (activityData.charKey !== charKey) {
+            activityData = { charKey, fetchedAt: now, rank: {}, branchOf: {} };
+        } else {
+            activityData = { ...activityData, fetchedAt: now };
+        }
         try {
             const context = SillyTavern.getContext();
             const headers = (typeof context.getRequestHeaders === 'function')
@@ -241,6 +269,18 @@
         return div.innerHTML;
     }
 
+    // v0.8.1: file names go into querySelector attribute values in several
+    // places; a name containing " or \ breaks the selector (legal chars in
+    // Linux filenames). Escape for use inside [file_name="..."].
+    function escAttr(value) {
+        return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    }
+
+    // Find the ORIGINAL (native, non-proxy) block for a chat file.
+    function findNativeBlock(fileName) {
+        return document.querySelector(`.select_chat_block[file_name="${escAttr(fileName)}"]:not(.tmc_proxy_block)`);
+    }
+
     function formatDate(dateStr) {
         if (!dateStr) return '';
         try {
@@ -279,8 +319,12 @@
     // fetch problem never breaks the (already-working) list rendering -
     // it just means that one entry keeps showing its normal last-message preview.
     async function fetchChatMessages(fileName) {
-        if (chatContentCache[fileName]) return chatContentCache[fileName];
-        if (chatContentPromises[fileName]) return chatContentPromises[fileName];
+        const key = contentCacheKey(fileName);
+        if (chatContentCache[key]) {
+            touchContentCache(key);
+            return chatContentCache[key];
+        }
+        if (chatContentPromises[key]) return chatContentPromises[key];
 
         const promise = (async () => {
             try {
@@ -290,13 +334,14 @@
                     : { 'Content-Type': 'application/json' };
 
                 const isGroup = !!context.groupId;
-                // NOTE: the group-chat request shape below is best-effort and
-                // untested - group chat storage in ST works differently from
-                // solo chats. If it 404s/fails, this just falls back to the
-                // normal last-message preview for group chats (see catch below).
+                // v0.8.1 FIX: the group branch used to send { id: context.groupId },
+                // i.e. /api/chats/group/get for the CURRENTLY OPEN chat — so every
+                // group chat's search preview showed snippets from whatever chat
+                // you happened to have open. Group chat files are keyed by chat
+                // id, which is exactly this list entry's fileName without .jsonl.
                 const url = isGroup ? '/api/chats/group/get' : '/api/chats/get';
                 const body = isGroup
-                    ? { id: context.groupId }
+                    ? { id: fileName.replace(/\.jsonl$/i, '') }
                     : { avatar_url: getCurrentCharacterId(), file_name: fileName };
 
                 const res = await fetch(url, {
@@ -314,18 +359,20 @@
                     ? data.filter(m => m && typeof m.mes === 'string').map(m => m.mes)
                     : [];
 
-                chatContentCache[fileName] = messages;
+                chatContentCache[key] = messages;
+                touchContentCache(key);
                 return messages;
             } catch (err) {
                 console.warn('[TMC] Could not fetch chat content for search preview:', fileName, err);
-                chatContentCache[fileName] = [];
+                chatContentCache[key] = [];
+                touchContentCache(key);
                 return [];
             } finally {
-                delete chatContentPromises[fileName];
+                delete chatContentPromises[key];
             }
         })();
 
-        chatContentPromises[fileName] = promise;
+        chatContentPromises[key] = promise;
         return promise;
     }
 
@@ -449,14 +496,34 @@
         }
     }
 
+    // v0.8.1 FIX: pins used to be keyed by bare fileName — pinning "New Chat"
+    // on one character pinned every same-named chat on every character. Keys
+    // are now character-scoped; legacy bare keys are still honored on read
+    // and migrated to the scoped form the next time that pin is toggled.
+    function pinKey(fileName) {
+        return String(getCurrentCharacterId() ?? '?') + '::' + fileName;
+    }
+
+    function isPinnedFile(fileName) {
+        const settings = getSettings();
+        if (!settings.pinned) return false;
+        return !!(settings.pinned[pinKey(fileName)] || settings.pinned[fileName]);
+    }
+
     function togglePin(fileName) {
         const settings = getSettings();
         if (!settings.pinned) settings.pinned = {};
 
-        if (settings.pinned[fileName]) {
-            delete settings.pinned[fileName];
+        const scoped = pinKey(fileName);
+        const wasPinned = !!(settings.pinned[scoped] || settings.pinned[fileName]);
+
+        // Migrate the legacy global key away regardless of toggle direction.
+        if (settings.pinned[fileName]) delete settings.pinned[fileName];
+
+        if (wasPinned) {
+            delete settings.pinned[scoped];
         } else {
-            settings.pinned[fileName] = true;
+            settings.pinned[scoped] = true;
         }
         saveSettings();
         scheduleSync();
@@ -628,7 +695,7 @@
 
         for (let i = startIndex; i < endIndex; i++) {
             const chat = chats[i];
-            const isPinned = settings.pinned && settings.pinned[chat.fileName];
+            const isPinned = isPinnedFile(chat.fileName);
             const proxy = createProxyBlock(chat, isPinned, searchTerm);
             fragment.appendChild(proxy);
         }
@@ -735,11 +802,6 @@
         // Only sync if user has opened the panel
         if (!userOpenedPanel) return;
 
-        // v0.8.0: fire-and-forget, TTL-gated. First render after popup open
-        // may lack ranks (falls back to date order); the fetch completion
-        // schedules another sync that re-renders with correct activity order.
-        refreshActivityData();
-
         try {
             const popups = [
                 document.querySelector('#shadow_select_chat_popup'),
@@ -748,6 +810,14 @@
 
             const popup = popups.find(p => p && getComputedStyle(p).display !== 'none');
             if (!popup) return;
+
+            // v0.8.1: moved BEHIND the popup-visible gate. Previously this sat
+            // at the top of performSync, so any sync scheduled while the popup
+            // was closed (mutations, CHAT_CHANGED) could still trigger the
+            // full-library /recent scan every TTL window during normal RP.
+            // Now it can only fire while the user is actually looking at the
+            // chat list. Fire-and-forget; completion schedules a re-render.
+            refreshActivityData();
 
             const nativeBlocks = Array.from(popup.querySelectorAll('.select_chat_block:not(.tmc_proxy_block)'));
 
@@ -868,6 +938,9 @@
                 currentView = 'main';
                 viewFolderId = null;
                 activeScrolledThisOpen = false;
+                // v0.8.1: element-identity checks make stale entries inert, but
+                // they still pile up across characters — drop them wholesale.
+                nativeDataCache = {};
                 if (bulkMode || selectedChats.size > 0) {
                     bulkMode = false;
                     selectedChats.clear();
@@ -930,7 +1003,7 @@
                 // native logic hasn't run yet" race that motivated disabling it.)
                 if (chat.element && chat.element.style && chat.element.style.display === 'none') return;
 
-                const isPinned = settings.pinned && settings.pinned[chat.fileName];
+                const isPinned = isPinnedFile(chat.fileName);
                 const fid = getFolderForChat(chat.fileName);
 
                 // If in folder view, only process valid chats
@@ -964,9 +1037,14 @@
                 }
 
 
-                // Render first batch synchronously
+                // Render first batch synchronously.
+                // v0.8.1: during search this used to render EVERY match at
+                // once, and each rendered block kicks a content fetch for its
+                // context snippet — with a large library one keystroke could
+                // fan out into hundreds of full-chat downloads. Cap the
+                // initial slab; the scroll sentinel lazy-loads the rest.
                 const initialBatchSize = searchTerm
-                    ? (chatsByFolder[fid] ? chatsByFolder[fid].length : 0)
+                    ? Math.min(chatsByFolder[fid] ? chatsByFolder[fid].length : 0, 30)
                     : BATCH_SIZE;
 
                 renderBatch(fid, 0, initialBatchSize, container, searchTerm);
@@ -1535,11 +1613,15 @@
 
             const toDelete = Array.from(selectedChats);
 
-            // Resolve numeric character index (this_chid) from context
             const context = SillyTavern.getContext();
             const characterId = context.characterId; // numeric index into context.characters[]
+            const groupId = context.groupId;
 
-            if (characterId === undefined || characterId === null) {
+            // v0.8.1 FIX: bulk delete previously required a numeric character
+            // index and hard-errored in group chats. Groups now route through
+            // ST's own deleteGroupChatByName, which also updates the group's
+            // chats[] registry and switches away if the open chat was deleted.
+            if (!groupId && (characterId === undefined || characterId === null)) {
                 toastr.error('Could not determine current character — cannot delete.');
                 return;
             }
@@ -1548,29 +1630,43 @@
             let fallbackNeeded = false;
 
             try {
-                // Import ST's own deleteCharacterChatByName — this uses getRequestHeaders() internally so CSRF tokens are handled correctly. fileName should not include .jsonl extension.
-                const { deleteCharacterChatByName } = await import('/script.js');
+                if (groupId) {
+                    const { deleteGroupChatByName } = await import('/scripts/group-chats.js');
+                    for (const fileName of toDelete) {
+                        try {
+                            await deleteGroupChatByName(groupId, fileName.replace(/\.jsonl$/i, ''));
+                            deletedCount++;
+                            const originalBlock = findNativeBlock(fileName);
+                            if (originalBlock) originalBlock.remove();
+                        } catch (err) {
+                            console.warn('[TMC] deleteGroupChatByName failed for:', fileName, err);
+                        }
+                    }
+                } else {
+                    // Import ST's own deleteCharacterChatByName — this uses getRequestHeaders() internally so CSRF tokens are handled correctly. fileName should not include .jsonl extension.
+                    const { deleteCharacterChatByName } = await import('/script.js');
 
-                for (const fileName of toDelete) {
-                    try {
-                        // Strip .jsonl if present (ST function appends it internally)
-                        const cleanName = fileName.replace(/\.jsonl$/i, '');
-                        await deleteCharacterChatByName(characterId, cleanName);
-                        deletedCount++;
+                    for (const fileName of toDelete) {
+                        try {
+                            // Strip .jsonl if present (ST function appends it internally)
+                            const cleanName = fileName.replace(/\.jsonl$/i, '');
+                            await deleteCharacterChatByName(characterId, cleanName);
+                            deletedCount++;
 
-                        // deleteCharacterChatByName bypasses ST's own delete-button click
-                        // flow, so ST never gets a chance to remove this chat's entry from
-                        // the already-rendered native popup list. Remove it ourselves so
-                        // the proxy tree doesn't keep mirroring a deleted chat until the
-                        // popup is closed and reopened.
-                        const originalBlock = document.querySelector(`.select_chat_block[file_name="${fileName}"]:not(.tmc_proxy_block)`);
-                        if (originalBlock) originalBlock.remove();
-                    } catch (err) {
-                        console.warn('[TMC] deleteCharacterChatByName failed for:', fileName, err);
+                            // deleteCharacterChatByName bypasses ST's own delete-button click
+                            // flow, so ST never gets a chance to remove this chat's entry from
+                            // the already-rendered native popup list. Remove it ourselves so
+                            // the proxy tree doesn't keep mirroring a deleted chat until the
+                            // popup is closed and reopened.
+                            const originalBlock = findNativeBlock(fileName);
+                            if (originalBlock) originalBlock.remove();
+                        } catch (err) {
+                            console.warn('[TMC] deleteCharacterChatByName failed for:', fileName, err);
+                        }
                     }
                 }
             } catch (importErr) {
-                console.warn('[TMC] Could not import deleteCharacterChatByName, trying fallback:', importErr);
+                console.warn('[TMC] Could not import ST delete function, trying fallback:', importErr);
                 fallbackNeeded = true;
             }
 
@@ -1578,7 +1674,7 @@
                 // Fallback if direct call won't work for some reason, just in case. This forces to press delete many times, but still better than waiting for page reloads.
                 toastr.info('Using fallback deletion — you will be prompted once per chat.');
                 for (const fileName of toDelete) {
-                    const originalBlock = document.querySelector(`.select_chat_block[file_name="${fileName}"]:not(.tmc_proxy_block)`);
+                    const originalBlock = findNativeBlock(fileName);
                     const delBtn = originalBlock?.querySelector('.mes_delete') ||
                         originalBlock?.querySelector('.fa-skull') ||
                         originalBlock?.querySelector('[class*="delete"]');
@@ -1664,7 +1760,7 @@
 
         if (!isBulk) {
             // Pin option
-            const pinText = (getSettings().pinned && getSettings().pinned[fileName]) ? 'Unpin' : 'Pin to top';
+            const pinText = isPinnedFile(fileName) ? 'Unpin' : 'Pin to top';
             html += `<div class="tmc_ctx_item" data-action="pin">📌 ${pinText}</div>`;
             // Add Rename and Delete
             html += `<div class="tmc_ctx_item" data-action="rename">✏️ Rename</div>`;
@@ -1696,12 +1792,12 @@
                     togglePin(fileName);
                 } else if (item.dataset.action === 'rename') {
                     // Trigger rename on original element
-                    const originalBlock = document.querySelector(`.select_chat_block[file_name="${fileName}"]:not(.tmc_proxy_block)`);
+                    const originalBlock = findNativeBlock(fileName);
                     const renameBtn = originalBlock?.querySelector('.renameChatButton') || originalBlock?.querySelector('.fa-pen');
                     if (renameBtn) renameBtn.click();
                 } else if (item.dataset.action === 'delete') {
                     // Trigger delete on original element
-                    const originalBlock = document.querySelector(`.select_chat_block[file_name="${fileName}"]:not(.tmc_proxy_block)`);
+                    const originalBlock = findNativeBlock(fileName);
                     // Look for typical delete class names
                     const delBtn = originalBlock?.querySelector('.mes_delete') ||
                         originalBlock?.querySelector('.fa-skull') ||
@@ -1752,8 +1848,67 @@
     function initObserver() {
         if (mutationObserver) mutationObserver.disconnect();
 
-        mutationObserver = new MutationObserver((mutations) => {
+        mutationObserver = new MutationObserver(handleMutations);
+
+        // v0.8.1 PERF ROOT FIX: this used to observe document.body with
+        // subtree+attributes. The v0.7.0 observer split (correctly) brought
+        // this observer back to life — and with it, EVERY DOM mutation in the
+        // app started flowing through our callback: thousands of message
+        // nodes while a big chat loads, style churn on every streamed token
+        // during generation. Each mutation paid an m.target.closest() DOM
+        // walk. We only ever care about the chat-select popup, so observe
+        // exactly those nodes. During RP and chat loads our callback now
+        // sees zero traffic.
+        observedPopupNodes = getPopupNodes();
+        if (observedPopupNodes.length > 0) {
+            for (const node of observedPopupNodes) {
+                mutationObserver.observe(node, {
+                    childList: true,
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: ['style', 'class']
+                });
+            }
+        } else {
+            // Unknown ST build without the standard popup ids: fall back to
+            // the old broad observation rather than silently doing nothing.
+            console.warn('[TMC] Chat popup nodes not found; falling back to body-wide observation');
+            mutationObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['style', 'class', 'id']
+            });
+        }
+    }
+
+    function getPopupNodes() {
+        return ['#shadow_select_chat_popup', '#select_chat_popup']
+            .map(sel => document.querySelector(sel))
+            .filter(Boolean);
+    }
+
+    // Single source of truth for "is the panel open", driven by the popup's
+    // own style mutations (any open path: menu click, slash command, etc.).
+    // v0.8.1: userOpenedPanel previously latched true FOREVER after the first
+    // open — heartbeat and sync kept doing per-tick work for the rest of the
+    // session. It now tracks real visibility; closing the popup also tears
+    // down bulk-selection state so the floating bulk bar can't outlive it.
+    function syncPanelVisibility() {
+        const visible = getPopupNodes().some(n => getComputedStyle(n).display !== 'none');
+        if (visible && !userOpenedPanel) {
+            userOpenedPanel = true;
+            activeScrolledThisOpen = false;
+            scheduleSync();
+        } else if (!visible && userOpenedPanel) {
+            userOpenedPanel = false;
+            if (bulkMode || selectedChats.size > 0) clearSelection();
+        }
+    }
+
+    function handleMutations(mutations) {
             let needsSync = false;
+            let popupToggled = false;
             for (const m of mutations) {
                 // IGNORE our own proxy elements
                 if (m.target.closest && m.target.closest('#tmc_proxy_root')) continue;
@@ -1762,12 +1917,13 @@
                 // Detect native chat blocks being added (async load)
                 if (m.target.id === 'select_chat_div' || m.target.classList?.contains('select_chat_block_wrapper')) {
                     needsSync = true;
-                    break;
+                    continue;
                 }
                 // Detect popup visibility changes
                 if (m.target.id === 'shadow_select_chat_popup' || m.target.id === 'select_chat_popup') {
+                    popupToggled = true;
                     needsSync = true;
-                    break;
+                    continue;
                 }
                 // Detect new blocks added anywhere in popup
                 if (m.addedNodes?.length > 0) {
@@ -1795,24 +1951,16 @@
                     m.target.classList?.contains('select_chat_block') &&
                     !m.target.classList.contains('tmc_proxy_block')) {
                     needsSync = true;
-                    break;
                 }
             }
+            if (popupToggled) syncPanelVisibility();
             if (needsSync && userOpenedPanel) scheduleSync();
-        });
-
-        mutationObserver.observe(document.body, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['style', 'class', 'id']
-        });
     }
 
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.8.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.8.1 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.8.0: restore persisted sort choice (falls back to activity-desc
@@ -1827,8 +1975,15 @@
         ctx.eventSource.on(ctx.event_types.CHAT_CHANGED, () => {
             // The open chat just changed — allow the next render to scroll to it.
             activeScrolledThisOpen = false;
-            // Opening/writing a chat bumps its mtime; the cached rank is stale.
-            refreshActivityData(true);
+            // v0.8.1 PERF FIX: v0.8.0 called refreshActivityData(true) here,
+            // which made EVERY chat open fire /api/chats/recent — an endpoint
+            // that stats AND line-streams every chat file in the whole library
+            // server-side. On a large library (and on Android/Termux, where
+            // that I/O competes with the chat file actually being loaded) this
+            // made opening old/big chats visibly slow. Ranks are only ever
+            // consumed by the popup, so: invalidate now, refetch lazily on the
+            // next sync that actually has the popup visible.
+            activityData.fetchedAt = 0;
             scheduleSync();
         });
 
@@ -1846,8 +2001,19 @@
 
         // Heartbeat: check for empty folders or missing proxy root
         setInterval(() => {
+            // v0.8.1: safety nets that must run even while the panel is closed —
+            // (a) if the popup nodes didn't exist at init (exotic ST build /
+            //     load order), attach the narrow observer as soon as they do;
+            // (b) reconcile visibility state in case a style mutation was
+            //     missed (also flips userOpenedPanel back off after close,
+            //     which stops all per-tick work below).
+            if (observedPopupNodes.length === 0 && getPopupNodes().length > 0) initObserver();
+            syncPanelVisibility();
+
+            if (!userOpenedPanel) return;
+
             const popup = document.querySelector('#shadow_select_chat_popup') || document.querySelector('#select_chat_popup');
-            if (userOpenedPanel && popup && getComputedStyle(popup).display !== 'none') {
+            if (popup && getComputedStyle(popup).display !== 'none') {
                 const proxy = popup.querySelector('#tmc_proxy_root');
                 const nativeBlocks = popup.querySelectorAll('.select_chat_block:not(.tmc_proxy_block)');
                 const proxyBlocks = popup.querySelectorAll('.tmc_proxy_block');

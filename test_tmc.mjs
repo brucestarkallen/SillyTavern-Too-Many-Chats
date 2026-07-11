@@ -86,7 +86,7 @@ console.log('[6] Observer split: static structure of the real file');
 console.log('[7] Reset wiring for scroll-once flag');
 {
     const resets = (src.match(/[^t] activeScrolledThisOpen = false/g) || []).length; // excludes 'let activeScrolledThisOpen'
-    assert(resets === 4, `flag reset in exactly 4 places, got ${resets}: CHAT_CHANGED, panel open, char switch, failed-scroll release`);
+    assert(resets === 5, `flag reset in exactly 5 places, got ${resets}: CHAT_CHANGED, panel open click, char switch, failed-scroll release, popup-visible transition`);
     assert(extract('createFolderDOM').includes('tmc_has_active'), 'folder dot wired');
 }
 
@@ -154,11 +154,130 @@ console.log('[11] v0.8.0 wiring: static structure of the real file');
     assert(!radCode.includes('pinned'), 'refresh omits pinned param in code (would corrupt mtime rank)');
     assert(rad.includes('metadata: true') && rad.includes('/api/chats/recent'), 'requests /recent with metadata:true');
     assert(extract('performSync').includes('refreshActivityData()'), 'performSync kicks TTL-gated refresh');
-    assert(src.includes("refreshActivityData(true)"), 'CHAT_CHANGED forces refresh (mtime just changed)');
+    const srcNoComments = src.split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+    assert(!srcNoComments.includes('refreshActivityData(true)'), 'no force-refresh remains in code (v0.8.1: was firing full-library scan per chat open)');
     assert(src.includes('"activity-desc">Active (Recent)') || src.includes("value=\"activity-desc\">Active (Recent)"), 'dropdown has Active option');
     assert(src.includes("sortOrder: 'activity-desc'"), 'defaultSettings carries persisted default');
     assert(src.includes('getSettings().sortOrder = sortOrder'), 'onchange persists selection');
     assert(extract('createProxyBlock').includes('getBranchParent'), 'branch chip wired into proxy block');
+}
+
+
+const stripComments = s => s.split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+
+console.log('[12] v0.8.1 perf wiring: fetch gated behind visible popup, observer scoped');
+{
+    const ps = stripComments(extract('performSync'));
+    const gateIdx = ps.indexOf('if (!popup) return;');
+    const fetchIdx = ps.indexOf('refreshActivityData()');
+    assert(gateIdx > -1 && fetchIdx > gateIdx, 'refreshActivityData sits AFTER the popup-visible gate');
+    const initFn = stripComments(extract('init'));
+    assert(initFn.includes('activityData.fetchedAt = 0'), 'CHAT_CHANGED invalidates activity cache');
+    assert(!initFn.includes('refreshActivityData'), 'CHAT_CHANGED never fetches directly');
+    const io = stripComments(extract('initObserver'));
+    assert(io.includes('getPopupNodes()') && io.includes('mutationObserver.observe(node'), 'observer attaches to popup nodes');
+    assert(io.includes('document.body'), 'body observation kept only as fallback branch');
+    assert(initFn.includes('syncPanelVisibility()') && initFn.includes('if (!userOpenedPanel) return;'), 'heartbeat reconciles visibility then early-outs when closed');
+}
+
+console.log('[13] syncPanelVisibility: open/close transitions and bulk-bar teardown');
+{
+    const mk = new Function('getPopupNodes', 'getComputedStyle', 'scheduleSync', 'clearSelection', 'state',
+        'let userOpenedPanel = state.open; let activeScrolledThisOpen = true; let bulkMode = state.bulk; let selectedChats = state.sel;\n'
+        + extract('syncPanelVisibility')
+        + '\nreturn { run: syncPanelVisibility, state: () => ({ userOpenedPanel, activeScrolledThisOpen }) };');
+    let synced = 0, cleared = 0;
+    // hidden -> visible
+    let h = mk(() => [{}], () => ({ display: 'flex' }), () => synced++, () => cleared++, { open: false, bulk: false, sel: new Set() });
+    h.run();
+    assert(h.state().userOpenedPanel === true && h.state().activeScrolledThisOpen === false && synced === 1, 'open transition: flag on, scroll reset, sync scheduled');
+    // visible -> hidden with live bulk selection
+    h = mk(() => [{}], () => ({ display: 'none' }), () => synced++, () => cleared++, { open: true, bulk: true, sel: new Set(['a']) });
+    h.run();
+    assert(h.state().userOpenedPanel === false && cleared === 1, 'close transition: flag off, bulk selection torn down');
+}
+
+console.log('[14] Content cache LRU: cap, eviction order, touch-refresh');
+{
+    const capMatch = src.match(/const CONTENT_CACHE_MAX = (\d+);/);
+    assert(!!capMatch, 'cap constant present');
+    const cap = parseInt(capMatch[1], 10);
+    const mk = new Function('CONTENT_CACHE_MAX',
+        'let chatContentCache = {}; let contentCacheOrder = [];\n'
+        + extract('touchContentCache')
+        + '\nreturn { touch: touchContentCache, set: (k) => { chatContentCache[k] = [k]; touchContentCache(k); }, cache: () => chatContentCache, order: () => contentCacheOrder };');
+    const c = mk(cap);
+    for (let i = 0; i < cap + 6; i++) c.set('A.png::chat' + i);
+    assert(Object.keys(c.cache()).length === cap, `cache bounded at ${cap} after ${cap + 6} inserts`);
+    assert(!c.cache()['A.png::chat0'] && !!c.cache()['A.png::chat' + (cap + 5)], 'oldest evicted, newest kept');
+    // touch-refresh: oldest surviving key touched, then one more insert evicts the SECOND-oldest instead
+    const survivors = c.order().slice();
+    c.touch(survivors[0]);
+    c.set('A.png::fresh');
+    assert(!!c.cache()[survivors[0]] && !c.cache()[survivors[1]], 'touched entry survives; untouched next-oldest evicted');
+}
+
+console.log('[15] Pin scoping: per-character isolation with legacy migration');
+{
+    const shared = { pinned: { 'New Chat.jsonl': true } }; // legacy global pin
+    let charKey = 'A.png';
+    const mk = new Function('getSettings', 'getCurrentCharacterId', 'saveSettings', 'scheduleSync',
+        extract('pinKey') + '\n' + extract('isPinnedFile') + '\n' + extract('togglePin')
+        + '\nreturn { pinKey, isPinnedFile, togglePin };');
+    const api15 = mk(() => shared, () => charKey, () => {}, () => {});
+    assert(api15.isPinnedFile('New Chat.jsonl') === true, 'legacy bare-key pin honored on read');
+    api15.togglePin('New Chat.jsonl'); // unpin: migrates legacy away
+    assert(!shared.pinned['New Chat.jsonl'] && !shared.pinned['A.png::New Chat.jsonl'], 'toggle migrates legacy key away');
+    api15.togglePin('New Chat.jsonl'); // pin again -> scoped
+    assert(shared.pinned['A.png::New Chat.jsonl'] === true, 'repin writes character-scoped key');
+    charKey = 'B.png';
+    assert(api15.isPinnedFile('New Chat.jsonl') === false, 'same filename NOT pinned on another character');
+}
+
+console.log('[16] Group preview fetches THIS entry, not the open chat');
+{
+    const fcm = stripComments(extract('fetchChatMessages'));
+    assert(/isGroup\s*\n?\s*\?\s*\{\s*id:\s*fileName\.replace/.test(fcm), 'group body id derived from fileName');
+    assert(!/id:\s*context\.groupId/.test(fcm), 'old wrong-file body gone');
+    assert(fcm.includes('contentCacheKey(fileName)'), 'cache reads/writes use character-scoped key');
+}
+
+console.log('[17] escAttr: selector-safe filenames');
+{
+    const esc = new Function(extract('escAttr') + '\nreturn escAttr;')();
+    assert(esc('a"b\\c') === 'a\\"b\\\\c', 'quotes and backslashes escaped');
+    assert(esc('plain name.jsonl') === 'plain name.jsonl', 'plain names untouched');
+    assert(stripComments(extract('findNativeBlock')).includes('escAttr(fileName)'), 'native block lookup routed through escAttr');
+}
+
+console.log('[18] Bulk delete: group branch wired through ST group-chats module');
+{
+    const ub = stripComments(extract('updateBulkBar'));
+    assert(ub.includes("import('/scripts/group-chats.js')") && ub.includes('deleteGroupChatByName(groupId'), 'group path uses deleteGroupChatByName');
+    assert(ub.includes('!groupId && (characterId === undefined'), 'character-missing error only fires OUTSIDE groups');
+}
+
+console.log('[19] refreshActivityData: stale ranks dropped synchronously on character switch');
+{
+    let fetchCalls = 0;
+    const pendingFetch = () => { fetchCalls++; return new Promise(() => {}); }; // never resolves
+    const ttl = parseInt(src.match(/const ACTIVITY_TTL_MS = (\d+);/)[1], 10);
+    const mk = new Function('getCurrentCharacterId', 'buildActivityData', 'scheduleSync', 'fetch', 'SillyTavern', 'ACTIVITY_TTL_MS', 'initial', 'console',
+        'let activityData = initial;\n' + 'async ' + extract('refreshActivityData')
+        + '\nreturn { run: refreshActivityData, get: () => activityData };');
+    const a = mk(() => 'B.png', () => ({ rank: {}, branchOf: {} }), () => {}, pendingFetch,
+        { getContext: () => ({ getRequestHeaders: () => ({}) }) }, ttl,
+        { charKey: 'A.png', fetchedAt: Date.now(), rank: { 'Old': 0 }, branchOf: { 'Old': 'P' } }, console);
+    a.run(); // char switched A -> B; fetch left pending on purpose
+    assert(a.get().charKey === 'B.png' && Object.keys(a.get().rank).length === 0, 'previous character ranks dropped before fetch resolves');
+    assert(fetchCalls === 1, 'fetch dispatched once');
+    a.run(); // same char, within TTL, not forced
+    assert(fetchCalls === 1, 'TTL gate suppresses duplicate fetch');
+}
+
+console.log('[20] Search render fan-out capped');
+{
+    assert(/searchTerm\s*\n?\s*\?\s*Math\.min\(/.test(extract('performSync')), 'initial search render capped via Math.min (sentinel lazy-loads rest)');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
