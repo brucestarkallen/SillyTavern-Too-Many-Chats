@@ -113,35 +113,30 @@ console.log('[8] buildActivityData: branch parentage extraction + character filt
     assert(JSON.stringify(build(undefined, 'A.png')) === JSON.stringify({ branchOf: {} }), 'non-array input safe');
 }
 
-console.log('[9] sortChats: last-active = max(stamp, last-msg) — THE branch scenario');
+console.log('[9] sortChats: precomputed activity field — THE branch scenario');
 {
-    let charKey = 'A.png';
-    const shared = { lastActive: { 'A.png::Branch #1 - Old': 5000 } };
-    const mkSort = new Function('sortOrder', 'getSettings', 'getCurrentCharacterId',
-        extract('lastActiveKey') + '\n' + extract('getLastActive') + '\n' + extract('sortChats') + '\nreturn sortChats;');
+    const mkSort = new Function('sortOrder', extract('sortChats') + '\nreturn sortChats;');
+    const mk = (name, date, activity) => ({ fileName: name + '.jsonl', activity, metadata: { name: name.toLowerCase(), date, msgCount: 0, size: 0 } });
     const chats = [
-        { fileName: 'Ancient.jsonl', metadata: { name: 'ancient', date: 100, msgCount: 0, size: 0 } },
-        { fileName: 'Fresh.jsonl', metadata: { name: 'fresh', date: 3000, msgCount: 0, size: 0 } },
-        { fileName: 'Branch #1 - Old.jsonl', metadata: { name: 'branch #1 - old', date: 990, msgCount: 0, size: 0 } },
-        { fileName: 'Old.jsonl', metadata: { name: 'old', date: 1000, msgCount: 0, size: 0 } },
+        mk('Ancient', 100, 100),
+        mk('Fresh', 3000, 3000),
+        mk('Branch #1 - Old', 990, 5000), // stamped: opened just now
+        mk('Old', 1000, 1000),
     ];
-    let out = mkSort('activity-desc', () => shared, () => charKey)([...chats]).map(c => c.fileName);
+    let out = mkSort('activity-desc')([...chats]).map(c => c.fileName);
     assert(JSON.stringify(out) === JSON.stringify(['Branch #1 - Old.jsonl', 'Fresh.jsonl', 'Old.jsonl', 'Ancient.jsonl']),
-        'stamped branch with OLD last-msg date sorts FIRST; unstamped by last-msg: ' + JSON.stringify(out));
-    // no stamps at all -> reduces to pure last-message ordering
-    out = mkSort('activity-desc', () => ({ lastActive: {} }), () => charKey)([...chats]).map(c => c.fileName);
+        'stamped branch with OLD last-msg date sorts FIRST: ' + JSON.stringify(out));
+    // unstamped library: activity collapses to last-msg time -> branch sinks (pre-fix behavior)
+    const cold = chats.map(c => ({ ...c, activity: c.metadata.date }));
+    out = mkSort('activity-desc')(cold).map(c => c.fileName);
     assert(JSON.stringify(out) === JSON.stringify(['Fresh.jsonl', 'Old.jsonl', 'Branch #1 - Old.jsonl', 'Ancient.jsonl']),
-        'unstamped library degrades to last-message desc (branch sinks: the pre-fix behavior)');
-    // max() semantics: an old stamp does NOT beat a newer message elsewhere
-    out = mkSort('activity-desc', () => ({ lastActive: { 'A.png::Old': 2000 } }), () => charKey)([...chats]).map(c => c.fileName);
-    assert(out[0] === 'Fresh.jsonl' && out[1] === 'Old.jsonl', 'stamp is a floor, not a tier: newer last-msg still wins');
-    // character isolation
-    charKey = 'B.png';
-    out = mkSort('activity-desc', () => shared, () => charKey)([...chats]).map(c => c.fileName);
-    assert(out[0] === 'Fresh.jsonl', 'stamps from another character ignored');
-    charKey = 'A.png';
-    out = mkSort('name-asc', () => shared, () => charKey)([...chats]).map(c => c.fileName);
-    assert(out[0] === 'Ancient.jsonl', 'regression: name-asc unaffected by stamps');
+        'unstamped library degrades to last-message desc');
+    // floor semantics
+    const floor = chats.map(c => ({ ...c, activity: c.fileName.startsWith('Old') ? 2000 : c.metadata.date }));
+    out = mkSort('activity-desc')(floor).map(c => c.fileName);
+    assert(out[0] === 'Fresh.jsonl' && out[1] === 'Old.jsonl', 'stamp is a floor, not a tier');
+    out = mkSort('name-asc')([...chats]).map(c => c.fileName);
+    assert(out[0] === 'Ancient.jsonl', 'regression: name-asc unaffected');
 }
 
 console.log('[10] getBranchParent: extension stripping and miss behavior');
@@ -229,14 +224,14 @@ console.log('[15] Pin scoping: per-character isolation with legacy migration');
     const shared = { pinned: { 'New Chat.jsonl': true } }; // legacy global pin
     let charKey = 'A.png';
     const mk = new Function('getSettings', 'getCurrentCharacterId', 'saveSettings', 'scheduleSync',
-        extract('pinKey') + '\n' + extract('isPinnedFile') + '\n' + extract('togglePin')
+        extract('normalizeChatId') + '\n' + extract('pinKey') + '\n' + extract('isPinnedFile') + '\n' + extract('togglePin')
         + '\nreturn { pinKey, isPinnedFile, togglePin };');
     const api15 = mk(() => shared, () => charKey, () => {}, () => {});
     assert(api15.isPinnedFile('New Chat.jsonl') === true, 'legacy bare-key pin honored on read');
     api15.togglePin('New Chat.jsonl'); // unpin: migrates legacy away
-    assert(!shared.pinned['New Chat.jsonl'] && !shared.pinned['A.png::New Chat.jsonl'], 'toggle migrates legacy key away');
+    assert(!shared.pinned['New Chat.jsonl'] && !shared.pinned['A.png::New Chat'] && !shared.pinned['New Chat'], 'toggle migrates legacy key away');
     api15.togglePin('New Chat.jsonl'); // pin again -> scoped
-    assert(shared.pinned['A.png::New Chat.jsonl'] === true, 'repin writes character-scoped key');
+    assert(shared.pinned['A.png::New Chat'] === true, 'repin writes normalized character-scoped key');
     charKey = 'B.png';
     assert(api15.isPinnedFile('New Chat.jsonl') === false, 'same filename NOT pinned on another character');
 }
@@ -370,6 +365,79 @@ console.log('[25] Family view wiring: static structure of the real file');
     assert(ib.includes('s.familyView = !s.familyView') && ib.includes('saveSettings()'), 'toggle persists');
     assert(src.includes('familyView: false') && src.includes('familyCollapsed: {}'), 'settings schema carries family keys');
     assert(stripComments(extract('createFamilyDOM')).includes('familyCollapseKey(root)'), 'collapse state character-scoped');
+}
+
+
+console.log('[26] Chat id normalization: folders survive with/without .jsonl eras');
+{
+    const shared26 = { folders: { f1: { name: 'F', chats: ['Old Tale.jsonl'] } }, characterFolders: { 'A.png': ['f1'] } };
+    const mk = new Function('getSettings', 'getCurrentCharacterId', 'saveSettings', 'scheduleSync',
+        extract('normalizeChatId') + '\n' + extract('moveChat') + '\n' + extract('getFolderForChat')
+        + '\nreturn { moveChat, getFolderForChat };');
+    const api26 = mk(() => shared26, () => 'A.png', () => {}, () => {});
+    assert(api26.getFolderForChat('Old Tale') === 'f1', 'legacy .jsonl-stored id matches current extensionless block');
+    assert(api26.getFolderForChat('Old Tale.jsonl') === 'f1', 'and matches with extension too');
+    api26.moveChat('New Story.jsonl', 'f1');
+    assert(shared26.folders.f1.chats.includes('New Story') && !shared26.folders.f1.chats.includes('New Story.jsonl'),
+        'moveChat stores normalized ids');
+    api26.moveChat('Old Tale', 'uncategorized');
+    assert(!shared26.folders.f1.chats.some(c => c.includes('Old Tale')), 'move-out strips legacy variant as well');
+    const initSrc = stripComments(extract('init'));
+    assert(initSrc.includes('normalizeChatId') && initSrc.includes('new Set'), 'one-time init migration normalizes + dedupes stored folder ids');
+}
+
+console.log('[27] Comparator perf: activity precomputed once per item per sync');
+{
+    const ps = stripComments(extract('performSync'));
+    assert(ps.includes('const laMap = getSettings().lastActive || {};'), 'stamp map snapshotted once per sync');
+    assert((ps.match(/laPrefix \+ fileName\.replace/g) || []).length === 2, 'activity computed on both cache-hit and fresh paths');
+    const sc = stripComments(extract('sortChats'));
+    assert(sc.includes('a.activity') && !sc.includes('getLastActive('), 'comparator reads precomputed field, never calls getSettings');
+}
+
+console.log('[28] Click-time native re-resolution');
+{
+    const cpb = stripComments(extract('createProxyBlock'));
+    assert((cpb.match(/findNativeBlock\(chatData\.fileName\)/g) || []).length >= 2, 'both button-forward and load-chat re-resolve at click time');
+    assert(cpb.includes('liveNative.querySelector'), 'forwarded buttons search the LIVE native block');
+}
+
+console.log('[29] Scroll + rendered-depth persistence across re-syncs');
+{
+    const rb = stripComments(extract('renderBatch'));
+    assert(rb.includes('renderedCounts[folderId] = Math.max'), 'renderBatch records section depth');
+    const ps = stripComments(extract('performSync'));
+    assert(ps.includes('lastScrollTop = body.scrollTop') && ps.includes('body.scrollTop = lastScrollTop'), 'scroll captured and restored around rebuild');
+    assert(ps.includes('renderedCounts = {};') && ps.includes('lastSearchTermSeen'), 'depths reset when the search term changes');
+    assert(ps.includes('Math.min(renderedCounts[fid] || 0, sectionLen)'), 'initial batch restores remembered depth (clamped)');
+    assert(stripComments(extract('syncPanelVisibility')).includes('renderedCounts = {}'), 'depths reset on popup close');
+}
+
+console.log('[30] Enrichment size guard');
+{
+    const cpb = stripComments(extract('createProxyBlock'));
+    assert(cpb.includes('ENRICH_MAX_BYTES') && /<= ENRICH_MAX_BYTES\)\s*{\s*enrichPreviewWithContext/.test(cpb),
+        'content fetch skipped for oversized chats; native preview retained');
+}
+
+console.log('[31] Proxy delete click routes to delete, not chat-load');
+{
+    const cpb = extract('createProxyBlock');
+    assert(cpb.includes('.PastChat_cross, .fa-skull') || (cpb.includes('.PastChat_cross') && cpb.includes('.fa-skull')),
+        'click-gate lists the native delete button classes');
+    assert(cpb.includes("'.PastChat_cross, .mes_delete, .fa-trash, .fa-skull"), 'forward mapping includes PastChat_cross');
+}
+
+console.log('[32] Title resolver + jump-to-open');
+{
+    const el = document.createElement('div');
+    el.innerHTML = '<div><small class="select_chat_block_filename">My Chat</small></div><div class="select_chat_block_mes">preview</div>';
+    const getTitle = new Function('el', extract('getTitleEl').replace(/^function getTitleEl\(el\)/, 'function getTitleEl(el)') + '\nreturn getTitleEl(el);');
+    const t = getTitle(el);
+    assert(t && t.textContent === 'My Chat', 'current ST title class resolved (highlighting/chips land in the title row again)');
+    const ib = stripComments(extract('injectAddButton'));
+    assert(ib.includes('tmc_jump_btn') && ib.includes('scrollIntoView'), 'jump-to-open button wired');
+    assert(!src.includes('createRecentDOM'), 'dead createRecentDOM removed');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
