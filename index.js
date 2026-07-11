@@ -1,7 +1,7 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.9.0 - Last-active sort done right: interaction stamps, max(stamp, last-msg); branch fetch max=60 + filename fallback
+ * v0.10.0 - Branch family view: per-lineage sections (parent + ordered branches), per character card
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -18,6 +18,8 @@
         characterFolders: {},
         pinned: {},
         lastActive: {},
+        familyView: false,
+        familyCollapsed: {},
         showRecent: true,
         sortOrder: 'activity-desc',
         version: '1.1.0'
@@ -302,6 +304,64 @@
         m = id.match(/^Branch #\d+ - (.*)$/);
         if (m && m[1]) return m[1];
         return null;
+    }
+
+    // ========== BRANCH FAMILIES (v0.10.0) ==========
+    // A "family" is one lineage: the parent chat plus every branch descended
+    // from it. Branch-of-a-branch climbs transitively to the root; a seen-set
+    // guards against pathological parentage cycles (renames can create
+    // A -> B -> A chains in metadata).
+    function resolveFamilyRoot(chatId) {
+        let current = String(chatId || '').replace(/\.jsonl$/i, '');
+        const seen = new Set([current]);
+        for (let hops = 0; hops < 10; hops++) {
+            const parent = getBranchParent(current);
+            if (!parent) return current;
+            const parentId = String(parent).replace(/\.jsonl$/i, '');
+            if (seen.has(parentId)) return current; // cycle: stop at last sane node
+            seen.add(parentId);
+            current = parentId;
+        }
+        return current;
+    }
+
+    // Pure: cluster an already-sorted list of chat ids into families.
+    // Returns { order, members, singles }:
+    //   order   — family roots, in first-appearance order (so with the
+    //             activity sort, the family containing the most recently
+    //             active chat comes first);
+    //   members — root -> ids (input order preserved inside each family);
+    //   singles — non-branch chats with no branches of their own.
+    // A lone branch whose parent was deleted still forms a family under the
+    // (absent) parent's name — the lineage label is the useful information.
+    function familyClusters(sortedIds, resolveRoot) {
+        const members = {};
+        const rootOrder = [];
+        for (const id of (Array.isArray(sortedIds) ? sortedIds : [])) {
+            const root = resolveRoot(id);
+            if (!members[root]) {
+                members[root] = [];
+                rootOrder.push(root);
+            }
+            members[root].push(id);
+        }
+        const order = [];
+        const singles = [];
+        for (const root of rootOrder) {
+            const m = members[root];
+            const isRealFamily = m.length > 1 || m[0] !== root;
+            if (isRealFamily) {
+                order.push(root);
+            } else {
+                singles.push(m[0]);
+                delete members[root];
+            }
+        }
+        return { order, members, singles };
+    }
+
+    function familyCollapseKey(root) {
+        return String(getCurrentCharacterId() ?? '?') + '::' + root;
     }
 
     function escapeHtml(text) {
@@ -725,7 +785,7 @@
     // Lazy Loading Helper (Append Only)
     // Lazy Loading Helper (Append Only)
     function renderBatch(folderId, startIndex, count, containerElement = null, searchTerm = '') {
-        const container = containerElement || document.querySelector(`.tmc_section[data-id="${folderId}"] .tmc_content`);
+        const container = containerElement || document.querySelector(`.tmc_section[data-id="${escAttr(folderId)}"] .tmc_content`);
         if (!container) return;
 
         const chats = chatsByFolder[folderId] || [];
@@ -770,8 +830,12 @@
         const badge = section.querySelector('.tmc_count');
         if (badge) badge.textContent = chats.length;
 
-        // Truncation logic for Main View (Strict 3 items)
-        if (currentView === 'main' && folderId !== 'uncategorized') {
+        // Truncation logic for Main View (Strict 3 items).
+        // v0.10.0: applies to MANUAL folders only — a family section's entire
+        // purpose is showing the full ordered lineage, so families are exempt
+        // and use the lazy-load sentinel like the uncategorized list instead.
+        const isFamily = String(folderId).startsWith('family::');
+        if (currentView === 'main' && folderId !== 'uncategorized' && !isFamily) {
             const children = Array.from(container.querySelectorAll('.tmc_proxy_block'));
             if (children.length > 3) {
                 // Remove excess from DOM for main view
@@ -798,7 +862,7 @@
         // Runs in dedicated Folder View, AND for the Uncategorized ("Your chats") list
         // in Main View, since that list is never truncated to 3 items and therefore
         // needs its own way to keep loading more than the initial BATCH_SIZE.
-        if ((currentView === 'folder' || folderId === 'uncategorized') && endIndex < chats.length) {
+        if ((currentView === 'folder' || folderId === 'uncategorized' || isFamily) && endIndex < chats.length) {
             const sentinel = document.createElement('div');
             sentinel.className = 'tmc_sentinel';
             sentinel.style.height = '20px';
@@ -998,12 +1062,44 @@
             const folderIds = settings.characterFolders[characterId] || [];
 
             // VIEW LOGIC SWITCH
+            // v0.10.0: family mode is a flat alternate organization of main
+            // view (no folder drill-down), so force back out of folder view.
+            const familyMode = !!settings.familyView;
+            if (familyMode && currentView === 'folder') {
+                currentView = 'main';
+                viewFolderId = null;
+            }
+            // Chat-id -> section-id map used by the distribution loop below
+            // when family mode is active (null otherwise).
+            let familyFidByChat = null;
+
             if (currentView === 'folder' && viewFolderId && settings.folders[viewFolderId]) {
                 // RENDER FOLDER VIEW
                 const folder = settings.folders[viewFolderId];
                 const section = createFolderViewDOM(viewFolderId, folder);
                 newTree.appendChild(section);
                 folderContents[viewFolderId] = section.querySelector('.tmc_content');
+            } else if (familyMode) {
+                // RENDER FAMILY VIEW: one section per branch lineage (root
+                // parent + all its branches, transitively), in order of the
+                // family's most recently active member (sortedData order),
+                // then everything else under "Other chats". Scoped — like all
+                // of TMC — to the current character card only.
+                const sortedIds = sortedData.map(c => c.fileName.replace(/\.jsonl$/i, ''));
+                const clusters = familyClusters(sortedIds, resolveFamilyRoot);
+                familyFidByChat = {};
+
+                for (const root of clusters.order) {
+                    const fid = 'family::' + root;
+                    for (const id of clusters.members[root]) familyFidByChat[id] = fid;
+                    const section = createFamilyDOM(root, clusters.members[root].length);
+                    newTree.appendChild(section);
+                    folderContents[fid] = section.querySelector('.tmc_content');
+                }
+
+                const uncatSection = createUncategorizedDOM('Other chats');
+                newTree.appendChild(uncatSection);
+                folderContents['uncategorized'] = uncatSection.querySelector('.tmc_content');
             } else {
                 // RENDER MAIN VIEW
                 // Reset view if invalid
@@ -1049,7 +1145,10 @@
                 if (chat.element && chat.element.style && chat.element.style.display === 'none') return;
 
                 const isPinned = isPinnedFile(chat.fileName);
-                const fid = getFolderForChat(chat.fileName);
+                const chatId = chat.fileName.replace(/\.jsonl$/i, '');
+                const fid = familyFidByChat
+                    ? (familyFidByChat[chatId] || 'uncategorized')
+                    : getFolderForChat(chat.fileName);
 
                 // If in folder view, only process valid chats
                 if (currentView === 'folder' && fid !== viewFolderId) return;
@@ -1258,7 +1357,48 @@
         return section;
     }
 
-    function createUncategorizedDOM() {
+    function createFamilyDOM(root, memberCount) {
+        const section = document.createElement('div');
+        section.className = 'tmc_section tmc_family';
+        section.dataset.id = 'family::' + root;
+
+        const collapsed = !!getSettings().familyCollapsed?.[familyCollapseKey(root)];
+        section.dataset.collapsed = collapsed ? 'true' : 'false';
+
+        if (isActiveChatFile(root) || isActiveChatFile(root + '.jsonl')) {
+            section.classList.add('tmc_has_active');
+        }
+
+        const header = document.createElement('div');
+        header.className = 'tmc_header tmc_family_header';
+        header.innerHTML = `
+            <div class="tmc_header_left">
+                <span class="tmc_toggle"><i class="fa-solid fa-chevron-down"></i></span>
+                <span class="tmc_icon"><i class="fa-solid fa-code-branch"></i></span>
+                <span class="tmc_name">${escapeHtml(root)}</span>
+                <span class="tmc_count">${memberCount}</span>
+            </div>
+        `;
+
+        header.onclick = () => {
+            const s = getSettings();
+            if (!s.familyCollapsed) s.familyCollapsed = {};
+            const key = familyCollapseKey(root);
+            s.familyCollapsed[key] = !s.familyCollapsed[key];
+            saveSettings();
+            scheduleSync();
+        };
+
+        const content = document.createElement('div');
+        content.className = 'tmc_content';
+        content.style.display = collapsed ? 'none' : '';
+
+        section.appendChild(header);
+        section.appendChild(content);
+        return section;
+    }
+
+    function createUncategorizedDOM(label = 'Your chats') {
         const section = document.createElement('div');
         section.className = 'tmc_section tmc_uncat';
         section.dataset.id = 'uncategorized';
@@ -1268,7 +1408,7 @@
         header.innerHTML = `
             <div class="tmc_header_left">
                 <span class="tmc_icon"><i class="fa-regular fa-comments"></i></span>
-                <span class="tmc_name">Your chats</span>
+                <span class="tmc_name">${escapeHtml(label)}</span>
                 <span class="tmc_count">0</span>
             </div>
         `;
@@ -1571,6 +1711,23 @@
             updateBulkBar();
         };
 
+        // FAMILIES TOGGLE (v0.10.0): alternate organization of the current
+        // character card's chats — one section per branch lineage (parent +
+        // all its branches, ordered), everything else under "Other chats".
+        const famBtn = document.createElement('div');
+        famBtn.className = 'menu_button tmc_add_btn tmc_family_btn';
+        famBtn.innerHTML = '<i class="fa-solid fa-code-branch"></i> Families';
+        famBtn.title = 'Group this character\'s chats by branch lineage';
+        if (getSettings().familyView) famBtn.classList.add('tmc_toggle_on');
+        famBtn.onclick = (e) => {
+            e.stopPropagation();
+            const s = getSettings();
+            s.familyView = !s.familyView;
+            saveSettings();
+            famBtn.classList.toggle('tmc_toggle_on', s.familyView);
+            scheduleSync();
+        };
+
         // SORT DROPDOWN
         const sortContainer = document.createElement('div');
         sortContainer.className = 'menu_button tmc_add_btn tmc_sort_btn';
@@ -1616,6 +1773,7 @@
         // Inject into the header row (found earlier)
         if (!headerRow.querySelector('.tmc_add_btn')) {
             headerRow.appendChild(sortContainer);
+            headerRow.appendChild(famBtn);
             headerRow.appendChild(bulkBtn);
             headerRow.appendChild(btn);
         }
@@ -2005,7 +2163,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.9.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.10.0 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.8.0: restore persisted sort choice (falls back to activity-desc

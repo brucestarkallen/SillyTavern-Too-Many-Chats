@@ -801,3 +801,18 @@
     pointer-events: none;
     white-space: nowrap;
 }
+
+/* ========== v0.10.0: BRANCH FAMILY VIEW ========== */
+.tmc_section.tmc_family > .tmc_header {
+    border-left: 3px solid color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 55%, transparent);
+    cursor: pointer;
+}
+
+.tmc_section.tmc_family[data-collapsed="true"] > .tmc_header .tmc_toggle i {
+    transform: rotate(-90deg);
+}
+
+.tmc_family_btn.tmc_toggle_on {
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 25%, transparent) !important;
+    box-shadow: inset 0 0 0 1px var(--SmartThemeQuoteColor, #e0a044);
+}

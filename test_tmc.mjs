@@ -326,5 +326,51 @@ console.log('[22] getBranchParent: metadata first, filename-pattern fallback');
     assert(getBP('Just A Chat.jsonl') === null, 'plain chats untouched');
 }
 
+
+console.log('[23] resolveFamilyRoot: transitive climb, cycle guard, extension handling');
+{
+    const chains = { 'C': 'B', 'B': 'A' };
+    const mk = new Function('getBranchParent', extract('resolveFamilyRoot') + '\nreturn resolveFamilyRoot;');
+    const resolve = mk((id) => chains[String(id).replace(/\.jsonl$/i, '')] || null);
+    assert(resolve('C.jsonl') === 'A', 'branch-of-a-branch climbs to root (C -> B -> A)');
+    assert(resolve('A') === 'A', 'root resolves to itself');
+    const cyc = mk((id) => ({ 'A': 'B', 'B': 'A' }[id] || null));
+    const r = cyc('A');
+    assert(r === 'A' || r === 'B', 'parentage cycle terminates deterministically without throwing');
+}
+
+console.log('[24] familyClusters: lineage sections, orphan branches, singles');
+{
+    const clusters = new Function(extract('familyClusters') + '\nreturn familyClusters;')();
+    const resolver = (id) => {
+        const m = id.match(/^(.*) - Branch #\d+$/) || id.match(/^Branch #\d+ - (.*)$/);
+        return m ? m[1] : id;
+    };
+    const out = clusters(['Branch #2 - Saga', 'Solo', 'Saga', 'Lost Tale - Branch #1'], resolver);
+    assert(JSON.stringify(out.order) === JSON.stringify(['Saga', 'Lost Tale']),
+        'family order follows first appearance (= most recently active member): ' + JSON.stringify(out.order));
+    assert(JSON.stringify(out.members['Saga']) === JSON.stringify(['Branch #2 - Saga', 'Saga']),
+        'parent and branches share one section, input order preserved');
+    assert(JSON.stringify(out.members['Lost Tale']) === JSON.stringify(['Lost Tale - Branch #1']),
+        'orphan branch (parent deleted) still forms a family under the lineage name');
+    assert(JSON.stringify(out.singles) === JSON.stringify(['Solo']), 'non-branch chats without branches stay single');
+    assert(JSON.stringify(clusters([], resolver)) === JSON.stringify({ order: [], members: {}, singles: [] }), 'empty input safe');
+}
+
+console.log('[25] Family view wiring: static structure of the real file');
+{
+    const ps = stripComments(extract('performSync'));
+    assert(ps.includes('familyClusters(') && ps.includes("'family::' + root"), 'performSync builds family sections from sorted order');
+    assert(ps.includes("createUncategorizedDOM('Other chats')"), 'non-family chats routed to Other chats in family mode');
+    assert(ps.includes('familyFidByChat[chatId]'), 'distribution loop routes through the family map');
+    const rb = stripComments(extract('renderBatch'));
+    assert(rb.includes("!isFamily") && rb.includes("|| isFamily)"), 'families exempt from 3-item truncation, included in sentinel lazy-load');
+    assert(rb.includes('escAttr(folderId)'), 'section lookup selector escaped (family ids contain arbitrary chat names)');
+    const ib = stripComments(extract('injectAddButton'));
+    assert(ib.includes('s.familyView = !s.familyView') && ib.includes('saveSettings()'), 'toggle persists');
+    assert(src.includes('familyView: false') && src.includes('familyCollapsed: {}'), 'settings schema carries family keys');
+    assert(stripComments(extract('createFamilyDOM')).includes('familyCollapseKey(root)'), 'collapse state character-scoped');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
