@@ -1,7 +1,7 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.8.1 - Perf: popup-scoped observer, gated activity fetch, LRU cache; fixes: group previews/bulk-delete, scoped pins
+ * v0.9.0 - Last-active sort done right: interaction stamps, max(stamp, last-msg); branch fetch max=60 + filename fallback
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -17,6 +17,7 @@
         folders: {},
         characterFolders: {},
         pinned: {},
+        lastActive: {},
         showRecent: true,
         sortOrder: 'activity-desc',
         version: '1.1.0'
@@ -178,40 +179,80 @@
 
     let activeScrolledThisOpen = false; // scroll to the open chat once per popup open
 
-    // ========== ACTIVITY DATA (v0.8.0) ==========
-    // Source of truth for "which chat was touched most recently": the server's
-    // /api/chats/recent endpoint, which stats every chat file and returns them
-    // in mtime-descending order (same clock as the welcome screen's Recent
-    // list). The payload does NOT include the mtime value itself for non-empty
-    // files (its last_mes field is the last message's send_date — the wrong
-    // clock again), so we use the array ORDER as a rank, never a timestamp.
-    // With metadata:true each item also carries chat_metadata.main_chat,
-    // giving branch parentage for free — no filename pattern guessing, works
-    // for renamed branches too.
-    let activityData = { charKey: null, fetchedAt: 0, rank: {}, branchOf: {} };
-    const ACTIVITY_TTL_MS = 15000;
+    // ========== ACTIVITY TRACKING (v0.9.0) ==========
+    // "Last active" the way a chat list should mean it: the moment you last
+    // interacted with the chat — opened it, sent, received, edited, swiped,
+    // deleted a message. TMC stamps these events itself into a persisted,
+    // character-scoped map. Sort key per chat = max(stamp, last-message time),
+    // so:
+    //   - a fresh branch is stamped the instant ST switches into it -> top,
+    //     immediately, no server round-trip (branching copies old messages,
+    //     so its last-message time is stale — the stamp overrides it);
+    //   - chats never touched since install fall back to last-message time,
+    //     which is correct for everything except pre-existing branches, and
+    //     those self-heal to the top the first time they're opened.
+    // v0.8.x tried to source this from /api/chats/recent mtime RANK instead;
+    // that had two defects: max=100000 made the server line-stream the whole
+    // library per popup open (seconds of latency before the list reordered),
+    // and anything outside the rank fell back to the wrong clock anyway.
+    const LAST_ACTIVE_HARD_CAP = 600;  // prune trigger
+    const LAST_ACTIVE_KEEP = 500;      // entries kept after prune
 
-    // Pure: turn the /recent response into {rank, branchOf} for one character.
-    // items: server array (already mtime-desc). charKey: avatar png filename
-    // for solo chats, group id for groups (same values getCurrentCharacterId
-    // returns). Items from other characters, root-level stray .jsonl files
-    // (no avatar/group field), and malformed entries are skipped; rank indices
-    // stay dense over the survivors.
+    function lastActiveKey(chatName) {
+        return String(getCurrentCharacterId() ?? '?') + '::' + String(chatName).replace(/\.jsonl$/i, '');
+    }
+
+    function stampActivity() {
+        const charKey = getCurrentCharacterId();
+        const chatName = getActiveChatName();
+        if (!charKey || !chatName) return;
+        const settings = getSettings();
+        if (!settings.lastActive) settings.lastActive = {};
+        settings.lastActive[lastActiveKey(chatName)] = Date.now();
+        pruneLastActive(settings.lastActive);
+        saveSettings();
+    }
+
+    function getLastActive(fileName) {
+        const settings = getSettings();
+        if (!settings.lastActive || !fileName) return 0;
+        return settings.lastActive[lastActiveKey(fileName)] || 0;
+    }
+
+    function pruneLastActive(map) {
+        const keys = Object.keys(map);
+        if (keys.length <= LAST_ACTIVE_HARD_CAP) return;
+        keys.sort((a, b) => map[a] - map[b]); // oldest first
+        const removeCount = keys.length - LAST_ACTIVE_KEEP;
+        for (let i = 0; i < removeCount; i++) delete map[keys[i]];
+    }
+
+    // ========== BRANCH METADATA (v0.8.0, repurposed v0.9.0) ==========
+    // /api/chats/recent is now used ONLY for chat_metadata.main_chat (branch
+    // parentage). Cost model of that endpoint: it stat()s every chat file
+    // (cheap) but line-streams only the top `max` by mtime — so max stays
+    // small. Branches older than the top 60 fall back to the filename
+    // pattern in getBranchParent below.
+    let activityData = { charKey: null, fetchedAt: 0, branchOf: {} };
+    const ACTIVITY_TTL_MS = 15000;
+    const BRANCH_FETCH_MAX = 60;
+
+    // Pure: extract branch parentage for one character from the /recent
+    // response. charKey: avatar png filename for solo chats, group id for
+    // groups. Items from other characters, root-level stray .jsonl files,
+    // and malformed entries are skipped.
     function buildActivityData(items, charKey) {
-        const rank = {};
         const branchOf = {};
-        let i = 0;
         for (const item of (Array.isArray(items) ? items : [])) {
             if (!item || typeof item.file_id !== 'string') continue;
             const key = item.avatar !== undefined ? item.avatar
                 : (item.group !== undefined ? item.group : null);
             if (key === null || String(key) !== String(charKey)) continue;
-            if (!(item.file_id in rank)) rank[item.file_id] = i++;
             const parent = (item.chat_metadata && typeof item.chat_metadata.main_chat === 'string')
                 ? item.chat_metadata.main_chat : null;
-            if (parent) branchOf[item.file_id] = parent;
+            if (parent && !(item.file_id in branchOf)) branchOf[item.file_id] = parent;
         }
-        return { rank, branchOf };
+        return { branchOf };
     }
 
     async function refreshActivityData(force = false) {
@@ -220,11 +261,10 @@
         const now = Date.now();
         if (!force && activityData.charKey === charKey && (now - activityData.fetchedAt) < ACTIVITY_TTL_MS) return;
         // Stamp before the await so concurrent syncs don't stack requests.
-        // v0.8.1: if the character changed, the old rank/branch maps belong to
-        // the previous character — drop them NOW rather than serving them for
-        // the duration of the fetch.
+        // If the character changed, the old branch map belongs to the previous
+        // character — drop it NOW rather than serving it during the fetch.
         if (activityData.charKey !== charKey) {
-            activityData = { charKey, fetchedAt: now, rank: {}, branchOf: {} };
+            activityData = { charKey, fetchedAt: now, branchOf: {} };
         } else {
             activityData = { ...activityData, fetchedAt: now };
         }
@@ -237,29 +277,31 @@
                 method: 'POST',
                 headers,
                 // No `pinned` on purpose: ST floats pinned chats to the front
-                // of this endpoint's sort, which would corrupt the mtime rank.
-                body: JSON.stringify({ max: 100000, metadata: true })
+                // of this endpoint's ordering, which would eat top-N slots.
+                body: JSON.stringify({ max: BRANCH_FETCH_MAX, metadata: true })
             });
             if (!res.ok) throw new Error('HTTP ' + res.status);
             const items = await res.json();
-            const { rank, branchOf } = buildActivityData(items, charKey);
-            activityData = { charKey, fetchedAt: Date.now(), rank, branchOf };
-            scheduleSync(); // re-render now that ranks exist
+            const { branchOf } = buildActivityData(items, charKey);
+            activityData = { charKey, fetchedAt: Date.now(), branchOf };
+            scheduleSync(); // re-render now that branch chips can appear
         } catch (err) {
-            console.warn('[TMC] Activity fetch failed — activity sort falls back to message-date order:', err);
-            activityData = { charKey, fetchedAt: Date.now(), rank: {}, branchOf: {} };
+            console.warn('[TMC] Branch metadata fetch failed — falling back to filename pattern only:', err);
+            activityData = { charKey, fetchedAt: Date.now(), branchOf: {} };
         }
-    }
-
-    function getActivityRank(fileName) {
-        const id = (fileName || '').replace(/\.jsonl$/i, '');
-        const r = activityData.rank[id];
-        return (typeof r === 'number') ? r : Number.MAX_SAFE_INTEGER;
     }
 
     function getBranchParent(fileName) {
         const id = (fileName || '').replace(/\.jsonl$/i, '');
-        return activityData.branchOf[id] || null;
+        if (activityData.branchOf[id]) return activityData.branchOf[id];
+        // Filename-pattern fallback for branches outside the metadata fetch
+        // window. Covers ST's default naming, current and legacy:
+        //   "<parent> - Branch #3"  /  "Branch #3 - <parent>"
+        let m = id.match(/^(.*) - Branch #\d+$/);
+        if (m && m[1]) return m[1];
+        m = id.match(/^Branch #\d+ - (.*)$/);
+        if (m && m[1]) return m[1];
+        return null;
     }
 
     function escapeHtml(text) {
@@ -636,20 +678,23 @@
             const metaB = b.metadata;
 
             switch (sortOrder) {
-                // v0.8.0: rank 0 = most recently modified. Files the server
-                // didn't report (race with a just-created chat, fetch failure)
-                // get MAX_SAFE_INTEGER and sink together; tie-break those by
-                // message date so a total fetch failure degrades to the old
-                // date sort instead of random order.
+                // v0.9.0: "last active" = max(interaction stamp, last-message
+                // time). The stamp covers exactly the case where the two
+                // clocks diverge: a branch carries copied old messages, so its
+                // last-message time lies about when you actually touched it.
+                // Unstamped chats (untouched since install) reduce cleanly to
+                // last-message ordering.
                 case 'activity-desc': {
-                    const ra = getActivityRank(a.fileName), rb = getActivityRank(b.fileName);
-                    if (ra !== rb) return ra - rb;
-                    return metaB.date - metaA.date;
+                    const ea = Math.max(getLastActive(a.fileName), metaA.date || 0);
+                    const eb = Math.max(getLastActive(b.fileName), metaB.date || 0);
+                    if (ea !== eb) return eb - ea;
+                    return metaA.name.localeCompare(metaB.name);
                 }
                 case 'activity-asc': {
-                    const ra = getActivityRank(a.fileName), rb = getActivityRank(b.fileName);
-                    if (ra !== rb) return rb - ra;
-                    return metaA.date - metaB.date;
+                    const ea = Math.max(getLastActive(a.fileName), metaA.date || 0);
+                    const eb = Math.max(getLastActive(b.fileName), metaB.date || 0);
+                    if (ea !== eb) return ea - eb;
+                    return metaA.name.localeCompare(metaB.name);
                 }
 
                 case 'name-asc': return metaA.name.localeCompare(metaB.name);
@@ -1960,7 +2005,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.8.1 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.9.0 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.8.0: restore persisted sort choice (falls back to activity-desc
@@ -1975,17 +2020,25 @@
         ctx.eventSource.on(ctx.event_types.CHAT_CHANGED, () => {
             // The open chat just changed — allow the next render to scroll to it.
             activeScrolledThisOpen = false;
-            // v0.8.1 PERF FIX: v0.8.0 called refreshActivityData(true) here,
-            // which made EVERY chat open fire /api/chats/recent — an endpoint
-            // that stats AND line-streams every chat file in the whole library
-            // server-side. On a large library (and on Android/Termux, where
-            // that I/O competes with the chat file actually being loaded) this
-            // made opening old/big chats visibly slow. Ranks are only ever
-            // consumed by the popup, so: invalidate now, refetch lazily on the
-            // next sync that actually has the popup visible.
+            // v0.9.0: opening a chat IS activity. This is precisely what puts
+            // a just-created branch at the top instantly (ST switches into the
+            // branch on creation), and lets pre-existing branches self-heal
+            // the first time they're opened.
+            stampActivity();
+            // Branch metadata may be stale (a branch might just have been
+            // created); invalidate so the next popup-visible sync refetches.
             activityData.fetchedAt = 0;
             scheduleSync();
         });
+
+        // v0.9.0: message-level interaction also counts as activity. Event
+        // names vary slightly across ST builds — subscribe only to the ones
+        // this build exposes.
+        for (const evName of ['MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED']) {
+            if (ctx.event_types[evName]) {
+                ctx.eventSource.on(ctx.event_types[evName], stampActivity);
+            }
+        }
 
         // Listen for user opening chat history popup
         document.addEventListener('click', (e) => {

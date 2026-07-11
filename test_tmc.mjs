@@ -91,50 +91,57 @@ console.log('[7] Reset wiring for scroll-once flag');
 }
 
 
-console.log('[8] buildActivityData: character filtering, rank density, branch map');
+console.log('[8] buildActivityData: branch parentage extraction + character filtering');
 {
     const build = new Function(extract('buildActivityData') + '\nreturn buildActivityData;')();
     const items = [
         { file_id: 'Branch #1 - Old', avatar: 'A.png', chat_metadata: { main_chat: 'Old' } },
         { file_id: 'Fresh', avatar: 'A.png' },
-        { file_id: 'OtherChar', avatar: 'B.png' },
-        { file_id: 'GroupChat1', group: 'g1' },
+        { file_id: 'OtherBranch', avatar: 'B.png', chat_metadata: { main_chat: 'Elsewhere' } },
+        { file_id: 'GB', group: 1720000000, chat_metadata: { main_chat: 'GroupParent' } },
         { file_id: 'Old', avatar: 'A.png', chat_metadata: {} },
-        { file_id: 'RootStray' },
+        { file_id: 'RootStray', chat_metadata: { main_chat: 'X' } },
         null,
         { file_id: 42, avatar: 'A.png' },
-        { file_id: 'Fresh', avatar: 'A.png' },
     ];
     const a = build(items, 'A.png');
-    assert(JSON.stringify(a.rank) === JSON.stringify({ 'Branch #1 - Old': 0, 'Fresh': 1, 'Old': 2 }),
-        'rank dense over survivors, other chars/groups/root/malformed/dupes excluded: ' + JSON.stringify(a.rank));
-    assert(JSON.stringify(a.branchOf) === JSON.stringify({ 'Branch #1 - Old': 'Old' }), 'branch parentage from chat_metadata.main_chat only');
-    const g = build(items, 'g1');
-    assert(JSON.stringify(g.rank) === JSON.stringify({ 'GroupChat1': 0 }), 'group filtering by group id');
-    const gn = build([{ file_id: 'GC', group: 1720000000 }], 1720000000);
-    assert(gn.rank['GC'] === 0, 'numeric group id matches via String coercion');
-    assert(JSON.stringify(build(undefined, 'A.png')) === JSON.stringify({ rank: {}, branchOf: {} }), 'non-array input safe');
+    assert(JSON.stringify(a.branchOf) === JSON.stringify({ 'Branch #1 - Old': 'Old' }),
+        'only current character branches captured: ' + JSON.stringify(a.branchOf));
+    assert(!('rank' in a), 'rank machinery gone from builder');
+    const g = build(items, 1720000000);
+    assert(g.branchOf['GB'] === 'GroupParent', 'numeric group id matches via String coercion');
+    assert(JSON.stringify(build(undefined, 'A.png')) === JSON.stringify({ branchOf: {} }), 'non-array input safe');
 }
 
-console.log('[9] sortChats: activity rank ordering with date tie-break fallback');
+console.log('[9] sortChats: last-active = max(stamp, last-msg) — THE branch scenario');
 {
-    const mkSort = new Function('sortOrder', 'activityData',
-        extract('getActivityRank') + '\n' + extract('sortChats') + '\nreturn sortChats;');
+    let charKey = 'A.png';
+    const shared = { lastActive: { 'A.png::Branch #1 - Old': 5000 } };
+    const mkSort = new Function('sortOrder', 'getSettings', 'getCurrentCharacterId',
+        extract('lastActiveKey') + '\n' + extract('getLastActive') + '\n' + extract('sortChats') + '\nreturn sortChats;');
     const chats = [
-        { fileName: 'Unranked2.jsonl', metadata: { name: 'unranked2', date: 111, msgCount: 0, size: 0 } },
-        { fileName: 'Fresh.jsonl', metadata: { name: 'fresh', date: 500, msgCount: 0, size: 0 } },
-        { fileName: 'Unranked.jsonl', metadata: { name: 'unranked', date: 999, msgCount: 0, size: 0 } },
-        { fileName: 'Branch #1 - Old.jsonl', metadata: { name: 'branch #1 - old', date: 50, msgCount: 0, size: 0 } },
+        { fileName: 'Ancient.jsonl', metadata: { name: 'ancient', date: 100, msgCount: 0, size: 0 } },
+        { fileName: 'Fresh.jsonl', metadata: { name: 'fresh', date: 3000, msgCount: 0, size: 0 } },
+        { fileName: 'Branch #1 - Old.jsonl', metadata: { name: 'branch #1 - old', date: 990, msgCount: 0, size: 0 } },
+        { fileName: 'Old.jsonl', metadata: { name: 'old', date: 1000, msgCount: 0, size: 0 } },
     ];
-    const ranked = { charKey: 'A.png', fetchedAt: 0, rank: { 'Branch #1 - Old': 0, 'Fresh': 1 }, branchOf: {} };
-    let out = mkSort('activity-desc', ranked)([...chats]).map(c => c.fileName);
-    assert(JSON.stringify(out) === JSON.stringify(['Branch #1 - Old.jsonl', 'Fresh.jsonl', 'Unranked.jsonl', 'Unranked2.jsonl']),
-        'activity-desc: fresh branch of OLD chat sorts FIRST (rank 0), unranked sink with date tie-break: ' + JSON.stringify(out));
-    out = mkSort('activity-desc', { charKey: null, fetchedAt: 0, rank: {}, branchOf: {} })([...chats]).map(c => c.fileName);
-    assert(JSON.stringify(out) === JSON.stringify(['Unranked.jsonl', 'Fresh.jsonl', 'Unranked2.jsonl', 'Branch #1 - Old.jsonl']),
-        'fetch-failure degradation: no ranks -> pure message-date desc');
-    out = mkSort('name-asc', ranked)([...chats]).map(c => c.fileName);
-    assert(out[0] === 'Branch #1 - Old.jsonl' && out[1] === 'Fresh.jsonl', 'regression: name-asc unaffected by ranks');
+    let out = mkSort('activity-desc', () => shared, () => charKey)([...chats]).map(c => c.fileName);
+    assert(JSON.stringify(out) === JSON.stringify(['Branch #1 - Old.jsonl', 'Fresh.jsonl', 'Old.jsonl', 'Ancient.jsonl']),
+        'stamped branch with OLD last-msg date sorts FIRST; unstamped by last-msg: ' + JSON.stringify(out));
+    // no stamps at all -> reduces to pure last-message ordering
+    out = mkSort('activity-desc', () => ({ lastActive: {} }), () => charKey)([...chats]).map(c => c.fileName);
+    assert(JSON.stringify(out) === JSON.stringify(['Fresh.jsonl', 'Old.jsonl', 'Branch #1 - Old.jsonl', 'Ancient.jsonl']),
+        'unstamped library degrades to last-message desc (branch sinks: the pre-fix behavior)');
+    // max() semantics: an old stamp does NOT beat a newer message elsewhere
+    out = mkSort('activity-desc', () => ({ lastActive: { 'A.png::Old': 2000 } }), () => charKey)([...chats]).map(c => c.fileName);
+    assert(out[0] === 'Fresh.jsonl' && out[1] === 'Old.jsonl', 'stamp is a floor, not a tier: newer last-msg still wins');
+    // character isolation
+    charKey = 'B.png';
+    out = mkSort('activity-desc', () => shared, () => charKey)([...chats]).map(c => c.fileName);
+    assert(out[0] === 'Fresh.jsonl', 'stamps from another character ignored');
+    charKey = 'A.png';
+    out = mkSort('name-asc', () => shared, () => charKey)([...chats]).map(c => c.fileName);
+    assert(out[0] === 'Ancient.jsonl', 'regression: name-asc unaffected by stamps');
 }
 
 console.log('[10] getBranchParent: extension stripping and miss behavior');
@@ -257,20 +264,22 @@ console.log('[18] Bulk delete: group branch wired through ST group-chats module'
     assert(ub.includes('!groupId && (characterId === undefined'), 'character-missing error only fires OUTSIDE groups');
 }
 
-console.log('[19] refreshActivityData: stale ranks dropped synchronously on character switch');
+console.log('[19] refreshActivityData: stale branch map dropped on switch; small fetch window');
 {
-    let fetchCalls = 0;
-    const pendingFetch = () => { fetchCalls++; return new Promise(() => {}); }; // never resolves
+    let fetchCalls = 0; let lastBody = null;
+    const pendingFetch = (url, opts) => { fetchCalls++; lastBody = opts.body; return new Promise(() => {}); };
     const ttl = parseInt(src.match(/const ACTIVITY_TTL_MS = (\d+);/)[1], 10);
-    const mk = new Function('getCurrentCharacterId', 'buildActivityData', 'scheduleSync', 'fetch', 'SillyTavern', 'ACTIVITY_TTL_MS', 'initial', 'console',
+    const bmax = parseInt(src.match(/const BRANCH_FETCH_MAX = (\d+);/)[1], 10);
+    assert(bmax <= 100, `branch fetch window small (${bmax}) — endpoint only line-streams top-N, so cost stays bounded`);
+    const mk = new Function('getCurrentCharacterId', 'buildActivityData', 'scheduleSync', 'fetch', 'SillyTavern', 'ACTIVITY_TTL_MS', 'BRANCH_FETCH_MAX', 'initial', 'console',
         'let activityData = initial;\n' + 'async ' + extract('refreshActivityData')
         + '\nreturn { run: refreshActivityData, get: () => activityData };');
-    const a = mk(() => 'B.png', () => ({ rank: {}, branchOf: {} }), () => {}, pendingFetch,
-        { getContext: () => ({ getRequestHeaders: () => ({}) }) }, ttl,
-        { charKey: 'A.png', fetchedAt: Date.now(), rank: { 'Old': 0 }, branchOf: { 'Old': 'P' } }, console);
+    const a = mk(() => 'B.png', () => ({ branchOf: {} }), () => {}, pendingFetch,
+        { getContext: () => ({ getRequestHeaders: () => ({}) }) }, ttl, bmax,
+        { charKey: 'A.png', fetchedAt: Date.now(), branchOf: { 'Old': 'P' } }, console);
     a.run(); // char switched A -> B; fetch left pending on purpose
-    assert(a.get().charKey === 'B.png' && Object.keys(a.get().rank).length === 0, 'previous character ranks dropped before fetch resolves');
-    assert(fetchCalls === 1, 'fetch dispatched once');
+    assert(a.get().charKey === 'B.png' && Object.keys(a.get().branchOf).length === 0, 'previous character branch map dropped before fetch resolves');
+    assert(fetchCalls === 1 && JSON.parse(lastBody).max === bmax && JSON.parse(lastBody).metadata === true, 'one fetch, bounded max, metadata on');
     a.run(); // same char, within TTL, not forced
     assert(fetchCalls === 1, 'TTL gate suppresses duplicate fetch');
 }
@@ -278,6 +287,43 @@ console.log('[19] refreshActivityData: stale ranks dropped synchronously on char
 console.log('[20] Search render fan-out capped');
 {
     assert(/searchTerm\s*\n?\s*\?\s*Math\.min\(/.test(extract('performSync')), 'initial search render capped via Math.min (sentinel lazy-loads rest)');
+}
+
+
+console.log('[21] Activity stamping: write, scope, prune');
+{
+    const shared2 = { lastActive: {} };
+    let saves = 0; let charKey2 = 'A.png'; let activeChat = 'My Branch';
+    const capHard = parseInt(src.match(/const LAST_ACTIVE_HARD_CAP = (\d+);/)[1], 10);
+    const capKeep = parseInt(src.match(/const LAST_ACTIVE_KEEP = (\d+);/)[1], 10);
+    const mk = new Function('getSettings', 'getCurrentCharacterId', 'getActiveChatName', 'saveSettings', 'LAST_ACTIVE_HARD_CAP', 'LAST_ACTIVE_KEEP',
+        extract('lastActiveKey') + '\n' + extract('stampActivity') + '\n' + extract('getLastActive') + '\n' + extract('pruneLastActive')
+        + '\nreturn { stamp: stampActivity, get: getLastActive, prune: pruneLastActive };');
+    const api21 = mk(() => shared2, () => charKey2, () => activeChat, () => saves++, capHard, capKeep);
+    api21.stamp();
+    assert(api21.get('My Branch.jsonl') > 0 && saves === 1, 'stamp written under scoped key, settings saved');
+    charKey2 = 'B.png';
+    assert(api21.get('My Branch.jsonl') === 0, 'stamp invisible from another character');
+    charKey2 = 'A.png'; activeChat = null;
+    api21.stamp();
+    assert(saves === 1, 'no active chat -> no write, no save');
+    // prune: overfill past hard cap, oldest dropped, newest kept
+    const m = {};
+    for (let i = 1; i <= capHard + 1; i++) m['A.png::c' + i] = i;
+    api21.prune(m);
+    assert(Object.keys(m).length === capKeep, `pruned to ${capKeep}`);
+    assert(!m['A.png::c1'] && !!m['A.png::c' + (capHard + 1)], 'oldest evicted, newest kept');
+}
+
+console.log('[22] getBranchParent: metadata first, filename-pattern fallback');
+{
+    const mk = new Function('activityData', extract('getBranchParent') + '\nreturn getBranchParent;');
+    const getBP = mk({ branchOf: { 'Meta Chat': 'Real Parent', 'Named - Branch #9': 'Metadata Wins' } });
+    assert(getBP('Meta Chat.jsonl') === 'Real Parent', 'metadata hit');
+    assert(getBP('Named - Branch #9.jsonl') === 'Metadata Wins', 'metadata takes precedence over pattern');
+    assert(getBP('Epic Story - Branch #3.jsonl') === 'Epic Story', 'modern naming fallback');
+    assert(getBP('Branch #2 - Old Tale') === 'Old Tale', 'legacy naming fallback');
+    assert(getBP('Just A Chat.jsonl') === null, 'plain chats untouched');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
