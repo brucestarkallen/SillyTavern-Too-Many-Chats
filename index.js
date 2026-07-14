@@ -1,7 +1,7 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.12.1 - Context-menu Move-to overhaul (contextual items, feedback toasts, new-folder-and-move), activity hint chip
+ * v0.12.2 - Hotfix for 0.12.1: restore helpers + single-move feedback missed by bad patch anchors
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -736,6 +736,39 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // v0.12.1: human-relative timestamp for the activity hint chip.
+    function formatRelativeTime(ts, now = Date.now()) {
+        const d = Math.max(0, now - ts);
+        const m = Math.floor(d / 60000);
+        if (m < 1) return 'now';
+        if (m < 60) return m + 'm ago';
+        const h = Math.floor(m / 60);
+        if (h < 24) return h + 'h ago';
+        return Math.floor(h / 24) + 'd ago';
+    }
+
+    // v0.12.1: pure builder for the context menu's Move-to section. The old
+    // section unconditionally showed a bare '💬 Your chats' entry — which,
+    // with no folders created and the chat already uncategorized, was a
+    // silent no-op button (reported as 'I click it and nothing happens').
+    // Rules: folders listed with a ✓ on the current one; 'Remove from folder'
+    // only when the chat is actually in one; 'New folder…' always available;
+    // with zero folders the section is JUST 'New folder…'.
+    function buildMoveSectionHtml(folderList, currentFid, isBulk) {
+        let html = '<div class="tmc_ctx_sep"></div><div class="tmc_ctx_head">Move to</div>';
+        for (const f of folderList) {
+            const isCurrent = !isBulk && f.fid === currentFid;
+            html += `<div class="tmc_ctx_item${isCurrent ? ' tmc_ctx_current' : ''}" data-fid="${f.fid}">📁 ${escapeHtml(f.name)}${isCurrent ? ' ✓' : ''}</div>`;
+        }
+        if (isBulk) {
+            if (folderList.length) html += '<div class="tmc_ctx_item" data-fid="uncategorized">🚫 Remove from folders</div>';
+        } else if (folderList.length && currentFid !== 'uncategorized') {
+            html += '<div class="tmc_ctx_item" data-fid="uncategorized">🚫 Remove from folder</div>';
+        }
+        html += '<div class="tmc_ctx_item" data-action="newfolder-move">➕ New folder…</div>';
+        return html;
     }
 
     // v0.8.1: file names go into querySelector attribute values in several
@@ -2515,8 +2548,17 @@
                         originalBlock?.querySelector('[class*="delete"]');
                     if (delBtn) delBtn.click();
                     else console.warn('TMC: Could not find delete button for', fileName);
-                } else {
-                    moveChat(fileName, item.dataset.fid);
+                } else if (item.dataset.fid) {
+                    const targetFid = item.dataset.fid;
+                    const beforeFid = getFolderForChat(fileName);
+                    if (beforeFid === targetFid) {
+                        toastr.info(`Already in ${folderLabel(targetFid)}`);
+                    } else {
+                        moveChat(fileName, targetFid);
+                        toastr.success(targetFid === 'uncategorized'
+                            ? `Removed from ${folderLabel(beforeFid)}`
+                            : `Moved to ${folderLabel(targetFid)}${familyHint}`);
+                    }
                 }
             }
             menu.remove();
@@ -2673,7 +2715,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.12.1 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.12.2 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.11.0 one-time migration: normalize + dedupe stored folder chat
