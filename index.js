@@ -1,7 +1,7 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.12.0 - Move chats between character cards (single + bulk, loss-safe); Cards browser mode (per-card sections, cross-card jump)
+ * v0.12.1 - Context-menu Move-to overhaul (contextual items, feedback toasts, new-folder-and-move), activity hint chip
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -931,13 +931,13 @@
 
 
     function createFolder(name) {
-        if (!name || !name.trim()) return;
+        if (!name || !name.trim()) return null;
         const settings = getSettings();
         const characterId = getCurrentCharacterId();
         if (!characterId) {
             console.warn('[TMC] getCurrentCharacterId returned null. Context:', SillyTavern.getContext());
             toastr.warning('Please select a character first');
-            return;
+            return null;
         }
 
         const folderId = generateId();
@@ -955,6 +955,7 @@
 
         saveSettings();
         scheduleSync();
+        return folderId;
     }
 
     function renameFolder(folderId, newName) {
@@ -1943,6 +1944,19 @@
             }
         }
 
+        // ACTIVITY HINT (v0.12.1): when the invisible interaction stamp is
+        // what ranks this chat (it exceeds the visible last-message date),
+        // say so — otherwise the Active sort looks wrong next to the dates.
+        const shownDate = (chatData.metadata && chatData.metadata.date) || 0;
+        if (chatData.activity && chatData.activity > shownDate + 60000) {
+            const hint = document.createElement('span');
+            hint.className = 'tmc_activity_hint';
+            hint.textContent = '⏱ active ' + formatRelativeTime(chatData.activity);
+            hint.title = 'Last time you opened or messaged this chat — this is what the Active sort uses';
+            const hTitleEl = getTitleEl(el);
+            if (hTitleEl) hTitleEl.appendChild(hint); else el.prepend(hint);
+        }
+
         // ACTIVE CHAT MARKER (v0.7.0)
         // Runs AFTER search highlighting on purpose: the highlight path
         // rewrites titleEl.innerHTML, which would wipe a chip added earlier.
@@ -2437,16 +2451,12 @@
             html += `<div class="tmc_ctx_item" data-action="rename">✏️ Rename</div>`;
             html += `<div class="tmc_ctx_item" data-action="movechar">👤 Move to card…</div>`;
             html += `<div class="tmc_ctx_item" data-action="delete" style="color:var(--red);">🗑️ Delete</div>`;
-            html += '<div class="tmc_ctx_sep"></div>';
-            html += '<div class="tmc_ctx_head">Move to</div>';
         }
 
-        folderIds.forEach(fid => {
-            const f = settings.folders[fid];
-            html += `<div class="tmc_ctx_item" data-fid="${fid}">📁 ${escapeHtml(f.name)}</div>`;
-        });
-        html += '<div class="tmc_ctx_sep"></div>';
-        html += '<div class="tmc_ctx_item" data-fid="uncategorized">💬 Your chats</div>';
+        const folderList = folderIds.map(fid => ({ fid, name: settings.folders[fid]?.name || '?' }))
+            .filter(f => f.name !== '?');
+        const currentFid = (!isBulk && fileName) ? getFolderForChat(fileName) : 'uncategorized';
+        html += buildMoveSectionHtml(folderList, currentFid, isBulk);
 
         menu.innerHTML = html;
         document.body.appendChild(menu);
@@ -2455,9 +2465,34 @@
             const item = ev.target.closest('.tmc_ctx_item');
             if (!item) return;
 
+            // Where did the chat(s) land — say so. Silent success reads as
+            // a broken button (v0.12.1).
+            const folderLabel = (fid) => fid === 'uncategorized'
+                ? 'Your chats'
+                : ('📁 ' + (getSettings().folders[fid]?.name || '?'));
+            const familyHint = getSettings().familyView && !cardsMode
+                ? ' — visible when Families is off' : '';
+
+            if (item.dataset.action === 'newfolder-move') {
+                const n = prompt('New folder name:');
+                const newFid = n ? createFolder(n) : null;
+                if (newFid) {
+                    const files = isBulk ? Array.from(selectedChats) : [fileName];
+                    files.forEach(f => moveChat(f, newFid));
+                    if (isBulk) clearSelection();
+                    toastr.success(`Moved ${files.length} chat${files.length !== 1 ? 's' : ''} to ${folderLabel(newFid)}${familyHint}`);
+                }
+                cleanup();
+                scheduleSync();
+                return;
+            }
+
             if (isBulk) {
                 const targetFid = item.dataset.fid;
                 selectedChats.forEach(file => moveChat(file, targetFid));
+                toastr.success(targetFid === 'uncategorized'
+                    ? `Removed ${selectedChats.size} chat${selectedChats.size !== 1 ? 's' : ''} from folders`
+                    : `Moved ${selectedChats.size} chat${selectedChats.size !== 1 ? 's' : ''} to ${folderLabel(targetFid)}${familyHint}`);
                 clearSelection();
             } else {
                 if (item.dataset.action === 'pin') {
@@ -2638,7 +2673,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.12.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.12.1 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.11.0 one-time migration: normalize + dedupe stored folder chat

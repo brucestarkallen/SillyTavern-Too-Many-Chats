@@ -866,3 +866,24 @@
     padding: 5px 8px;
     color: inherit;
 }
+
+/* ========== v0.12.1: MOVE FEEDBACK + ACTIVITY HINT ========== */
+.tmc_ctx_item.tmc_ctx_current {
+    opacity: 0.8;
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 12%, transparent);
+}
+
+.tmc_activity_hint {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    font-size: 10px;
+    line-height: 1.4;
+    border-radius: 8px;
+    color: var(--SmartThemeQuoteColor, #e0a044);
+    border: 1px dashed color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 45%, transparent);
+    opacity: 0.85;
+    vertical-align: middle;
+    pointer-events: none;
+    white-space: nowrap;
+}

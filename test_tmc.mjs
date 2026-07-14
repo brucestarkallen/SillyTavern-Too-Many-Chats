@@ -541,5 +541,51 @@ console.log('[37] v0.12.0 wiring');
     assert(cb <= 500, 'cards fetch bounded (' + cb + ')');
 }
 
+
+console.log('[38] Move-to section: contextual items, no more silent no-op entry');
+{
+    const build = new Function('escapeHtml', extract('buildMoveSectionHtml') + '\nreturn buildMoveSectionHtml;')((s) => s);
+    // his exact situation: zero folders, chat uncategorized
+    let html = build([], 'uncategorized', false);
+    assert(!html.includes('Your chats') && !html.includes('Remove from folder'), 'no folders -> no dead entries');
+    assert(html.includes('newfolder-move'), 'New folder… offered instead');
+    // in a folder
+    html = build([{ fid: 'f1', name: 'Arcs' }, { fid: 'f2', name: 'Side' }], 'f1', false);
+    assert(html.includes('Arcs ✓') && html.includes('tmc_ctx_current'), 'current folder marked');
+    assert(html.includes('Remove from folder'), 'remove offered when actually in a folder');
+    // uncategorized WITH folders existing
+    html = build([{ fid: 'f1', name: 'Arcs' }], 'uncategorized', false);
+    assert(!html.includes('Remove from folder'), 'no remove when not in a folder');
+    // bulk
+    html = build([{ fid: 'f1', name: 'Arcs' }], 'uncategorized', true);
+    assert(html.includes('Remove from folders') && !html.includes('✓'), 'bulk: plural remove, no current marker');
+    // folder names still escaped upstream
+    const esc = new Function('escapeHtml', extract('buildMoveSectionHtml') + '\nreturn buildMoveSectionHtml;')((s) => s.replace(/</g, '&lt;'));
+    assert(!esc([{ fid: 'f1', name: '<img>' }], 'x', false).includes('<img>'), 'folder names escaped');
+}
+
+console.log('[39] formatRelativeTime');
+{
+    const rel = new Function(extract('formatRelativeTime') + '\nreturn formatRelativeTime;')();
+    const now = 1000000000000;
+    assert(rel(now - 30 * 1000, now) === 'now', 'sub-minute');
+    assert(rel(now - 5 * 60000, now) === '5m ago', 'minutes');
+    assert(rel(now - 3 * 3600000, now) === '3h ago', 'hours');
+    assert(rel(now - 49 * 3600000, now) === '2d ago', 'days');
+}
+
+console.log('[40] Feedback wiring');
+{
+    const cm = stripComments(extract('showContextMenu'));
+    assert(cm.includes('buildMoveSectionHtml(folderList, currentFid, isBulk)'), 'menu uses the contextual builder');
+    assert(cm.includes('Already in') && cm.includes('Removed from') && cm.includes('Moved to'), 'every outcome toasts — including the former silent no-op');
+    assert(cm.includes('newfolder-move') && cm.includes('createFolder(n)'), 'new-folder-and-move path wired');
+    assert(cm.includes('visible when Families is off'), 'family-mode moves explain where the chat went');
+    const cf = stripComments(extract('createFolder'));
+    assert(cf.includes('return folderId;') && cf.includes('return null;'), 'createFolder returns fid / null');
+    const cpb = stripComments(extract('createProxyBlock'));
+    assert(cpb.includes('tmc_activity_hint') && cpb.includes('shownDate + 60000'), 'stamp-driven ordering surfaced as a chip when it outranks the visible date');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
